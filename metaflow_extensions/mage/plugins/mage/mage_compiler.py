@@ -629,9 +629,9 @@ def run_{step_name}(*args, **kwargs):
                 '    except Exception as _e:\n'
                 '        print("Warning: could not read _foreach_num_splits: %%s" %% _e)\n'
             ) % (
-                repr(self.name),
+                repr(self._flow_name),
                 repr(step_name),
-                repr(self.name),
+                repr(self._flow_name),
                 step_name,
             )
             foreach_return_field = ', "foreach_count": foreach_count'
