@@ -708,6 +708,14 @@ def run_{step_name}(*args, **kwargs):
     print("Step {step_name} completed successfully")
     if result.stdout:
         print("STDOUT:", result.stdout[-2000:])
+    # DEBUG: find 0.data.json files immediately after step to locate actual write path
+    if {step_name!r} == "start":
+        import subprocess as _dbgsp
+        _dbg = _dbgsp.run(
+            ["find", "/", "-maxdepth", "10", "-name", "0.data.json", "-path", "*/start/*"],
+            capture_output=True, text=True, timeout=15
+        ).stdout.strip()
+        print("DBG_FIND_AFTER_STEP:", _dbg[:500] if _dbg else "(nothing found)")
 {foreach_count_code}
     return {{"run_id": run_id, "step": {step_name!r}, "status": "success"{foreach_return_field}}}
 '''.format(
