@@ -147,9 +147,18 @@ class MageCompiler:
         return flow_name_to_pipeline_uuid(self._flow_name)
 
     def _get_parameters(self) -> Dict[str, Any]:
-        """Return a dict of Metaflow parameters from the flow."""
+        """Return a dict of Metaflow Parameters (excludes Config objects) from the flow.
+
+        Config objects are handled separately via METAFLOW_FLOW_CONFIG_VALUE and must NOT
+        be passed as CLI args to `metaflow init` — they are not writable CLI options in
+        the same way as Parameters.
+        """
         params = {}
         for var, param in self.flow._get_parameters():
+            # Skip Config parameters — they are passed via METAFLOW_FLOW_CONFIG_VALUE,
+            # not as individual --<name> CLI args to the init command.
+            if getattr(param, "IS_CONFIG_PARAMETER", False):
+                continue
             default = None
             if "default" in param.kwargs:
                 d = param.kwargs["default"]
@@ -297,15 +306,24 @@ def metaflow_init(*args, **kwargs):
     # We forward them as --<param_name> <value> CLI args to `metaflow init`.
     param_names = {param_names_repr}
     param_args = []
-    # kwargs may contain 'variables' dict (from Mage pipeline_run variables) or direct keys
-    variables = kwargs.get('variables', {{}})
-    if not variables and kwargs:
-        variables = {{k: v for k, v in kwargs.items()
-                     if k not in ('pipeline_run_id', 'context', 'block_uuid', 'event',
-                                  'configuration', 'spark', 'logger', 'run_started_at')}}
+    # Mage may expose pipeline-run variables in different ways depending on version:
+    #   1. Flat in kwargs directly (most common: global_vars merged in)
+    #   2. Nested under kwargs['variables'] (older API path)
+    # We check BOTH sources for each param so we cover all Mage versions.
+    _MAGE_INTERNAL_KEYS = {{
+        'pipeline_run_id', 'context', 'block_uuid', 'event',
+        'configuration', 'spark', 'logger', 'run_started_at',
+        'trigger_name', 'execution_date', 'execution_partition',
+        'ds', 'hr', 'interval_start_datetime', 'interval_end_datetime',
+        'interval_seconds', 'retry', 'env',
+    }}
+    _nested_vars = kwargs.get('variables') or {{}}
     for pname in param_names:
-        val = variables.get(pname)
-        if val is not None:
+        # Priority: nested variables dict > direct kwarg
+        val = _nested_vars.get(pname)
+        if val is None:
+            val = kwargs.get(pname)
+        if val is not None and pname not in _MAGE_INTERNAL_KEYS:
             param_args += ["--" + pname, str(val)]
 
     # Initialize the Metaflow run (creates _parameters artifact, registers run)
@@ -466,8 +484,16 @@ def run_{step_name}(*args, **kwargs):
         raise RuntimeError("No run_id found from upstream block output")
 
     params_task_id = "mage-params"
-    # Cap.RETRY: derive retry_count from Mage block attempt number
-    retry_count = kwargs.get("context", {{}}).get("retry_count", 0) if kwargs else 0
+    # Cap.RETRY: derive retry_count from Mage block attempt number.
+    # Mage exposes retry info as kwargs['retry']['attempts'] (via BlockExecutor.retry_metadata).
+    # Fall back to kwargs['context']['retry_count'] for compatibility with older Mage versions.
+    if kwargs:
+        _retry_meta = kwargs.get("retry") or {}
+        retry_count = int(_retry_meta.get("attempts", 0)) if isinstance(_retry_meta, dict) else 0
+        if retry_count == 0:
+            retry_count = int((kwargs.get("context") or {{}}).get("retry_count", 0))
+    else:
+        retry_count = 0
 
     env = os.environ.copy()
 {env_lines}
@@ -583,8 +609,16 @@ def run_{step_name}(*args, **kwargs):
 
     params_task_id = "mage-params"  # task_id used in metaflow init (non-integer so metadata registers it)
     task_id = "mage-1"  # non-integer task_id forces local metadata to create _self.json
-    # Cap.RETRY: derive retry_count from Mage block attempt number
-    retry_count = kwargs.get("context", {{}}).get("retry_count", 0) if kwargs else 0
+    # Cap.RETRY: derive retry_count from Mage block attempt number.
+    # Mage exposes retry info as kwargs['retry']['attempts'] (via BlockExecutor.retry_metadata).
+    # Fall back to kwargs['context']['retry_count'] for compatibility with older Mage versions.
+    if kwargs:
+        _retry_meta = kwargs.get("retry") or {{}}
+        retry_count = int(_retry_meta.get("attempts", 0)) if isinstance(_retry_meta, dict) else 0
+        if retry_count == 0:
+            retry_count = int((kwargs.get("context") or {{}}).get("retry_count", 0))
+    else:
+        retry_count = 0
 
     env = os.environ.copy()
 {env_lines}

@@ -276,16 +276,38 @@ class MageDeployedFlow(DeployedFlow):
         schedule_id = additional_info.get("schedule_id")
         schedule_token = additional_info.get("schedule_token")
 
+        try:
+            import requests
+        except ImportError:
+            raise RuntimeError("The `requests` package is required to trigger Mage pipelines.")
+
+        # If schedule_id / schedule_token are missing (e.g. from_deployment with plain name
+        # where the initial API lookup failed or the deployment predates schedule creation),
+        # do a fresh lookup now at trigger time.
+        if not schedule_id or not schedule_token:
+            try:
+                resp = requests.get(
+                    "%s/api/pipelines/%s/pipeline_schedules" % (mage_host, pipeline_uuid),
+                    headers={"Content-Type": "application/json"},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    resp_data = resp.json()
+                    if "error" not in resp_data:
+                        schedules = resp_data.get("pipeline_schedules", [])
+                        for sched in schedules:
+                            if sched.get("schedule_type") == "api" and sched.get("status") == "active":
+                                schedule_id = str(sched["id"])
+                                schedule_token = sched.get("token")
+                                break
+            except Exception:
+                pass
+
         if not schedule_id or not schedule_token:
             raise RuntimeError(
                 "Cannot trigger Mage pipeline %r: missing schedule_id or schedule_token. "
                 "Deploy the flow first with: python flow.py mage create" % pipeline_uuid
             )
-
-        try:
-            import requests
-        except ImportError:
-            raise RuntimeError("The `requests` package is required to trigger Mage pipelines.")
 
         # Build variables dict from kwargs
         variables = {k: str(v) for k, v in kwargs.items()} if kwargs else {}
@@ -364,14 +386,21 @@ class MageDeployedFlow(DeployedFlow):
                 if k not in ("name", "flow_name", "flow_file")
             }
         else:
-            # Cap.FROM_DEPLOYMENT: handle dotted names (project.branch.FlowName)
+            # Cap.FROM_DEPLOYMENT: identifier is either a plain flow name (e.g. "HelloFlow")
+            # or a pipeline UUID (e.g. "hello_from_deployment_user_runner_hellofromdeploymentflow").
+            # Pipeline UUIDs have no dots (dots are replaced with underscores at compile time),
+            # so split(".")[-1] returns the full identifier when it's already a UUID.
             flow_name = identifier.split(".")[-1]
             mage_host = os.environ.get("MAGE_HOST", "http://localhost:6789")
             mage_project = os.environ.get("MAGE_PROJECT", "metaflow_project")
+            # If identifier is already a pipeline UUID (underscored lowercase), use as-is.
+            # Otherwise derive it from the flow class name.
             pipeline_uuid = flow_name_to_pipeline_uuid(flow_name)
 
             # Cap.SCHEDULE_METADATA: fetch schedule_id and schedule_token from Mage API
             # so that _trigger_direct can trigger the pipeline without needing a flow file.
+            # schedule_id/token are fetched here for efficiency; _trigger_direct will retry
+            # the lookup on failure.
             schedule_id = None
             schedule_token = None
             try:
@@ -379,14 +408,17 @@ class MageDeployedFlow(DeployedFlow):
                 resp = _req.get(
                     "%s/api/pipelines/%s/pipeline_schedules" % (mage_host, pipeline_uuid),
                     headers={"Content-Type": "application/json"},
+                    timeout=10,
                 )
-                if resp.status_code == 200 and "error" not in resp.json():
-                    schedules = resp.json().get("pipeline_schedules", [])
-                    for sched in schedules:
-                        if sched.get("schedule_type") == "api" and sched.get("status") == "active":
-                            schedule_id = str(sched["id"])
-                            schedule_token = sched["token"]
-                            break
+                if resp.status_code == 200:
+                    resp_data = resp.json()
+                    if "error" not in resp_data:
+                        schedules = resp_data.get("pipeline_schedules", [])
+                        for sched in schedules:
+                            if sched.get("schedule_type") == "api" and sched.get("status") == "active":
+                                schedule_id = str(sched["id"])
+                                schedule_token = sched.get("token")
+                                break
             except Exception:
                 pass
 
