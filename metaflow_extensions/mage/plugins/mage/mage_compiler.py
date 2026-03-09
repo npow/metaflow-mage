@@ -15,7 +15,6 @@ Pipeline execution model:
 The pipeline_uuid is derived from the flow name (lowercase, underscores).
 """
 
-import hashlib
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +23,49 @@ from typing import Any, Dict, List, Optional, Tuple
 def flow_name_to_pipeline_uuid(name: str) -> str:
     """Convert a Metaflow flow name to a Mage pipeline UUID (lowercase, underscores)."""
     return name.lower().replace("-", "_").replace(".", "_")
+
+
+# ---------------------------------------------------------------------------
+# Shared constants for generated block code
+# ---------------------------------------------------------------------------
+
+# Standard header for every generated Mage custom block.
+_BLOCK_HEADER = """\
+import os
+import subprocess
+import sys
+
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+
+"""
+
+# Inline Python script that reads _foreach_num_splits from the local datastore.
+# Called via subprocess so it runs in a clean process with access to the data files.
+# Args: run_id, flow_name, task_id, sysroot_hint, step_name
+_FOREACH_NUM_SPLITS_READER_SCRIPT = r"""
+import json, gzip, pickle, os, sys
+_r = sys.argv[1]; _f = sys.argv[2]; _t = sys.argv[3]
+_hint = sys.argv[4] if len(sys.argv) > 4 else ""
+_step = sys.argv[5] if len(sys.argv) > 5 else "start"
+_candidates = [_hint, "/home/runner", "/root", os.environ.get("HOME",""), "/tmp"]
+_p = None
+for _cand in _candidates:
+    if not _cand: continue
+    _dir = os.path.join(_cand, ".metaflow", _f, _r, _step, _t)
+    if os.path.isdir(_dir):
+        _files = sorted([x for x in os.listdir(_dir) if x.endswith(".data.json")], reverse=True)
+        if _files:
+            _p = os.path.join(_dir, _files[0]); _mf_root = os.path.join(_cand, ".metaflow"); break
+if not _p: sys.exit(0)
+_obj = json.load(open(_p)).get("objects", {})
+_key = _obj.get("_foreach_num_splits")
+if not _key: sys.exit(0)
+_bp = os.path.join(_mf_root, _f, "data", _key[:2], _key)
+_blob = open(_bp, "rb").read()
+try: print(int(pickle.loads(gzip.decompress(_blob))))
+except: print(int(pickle.loads(_blob)))
+"""
 
 
 class MageCompiler:
@@ -63,39 +105,25 @@ class MageCompiler:
         self.graph = graph
         self.flow = flow
         self.flow_file = flow_file
-        self.metadata = metadata
-        self.flow_datastore = flow_datastore
-        self.environment = environment
-        self.event_logger = event_logger
-        self.monitor = monitor
         self.tags = tags or []
         self.namespace = namespace
         self.username = username or ""
-        self.max_workers = max_workers
         self.with_decorators = with_decorators or []
         self.branch = branch
         self.production = production
-        self.mage_host = mage_host
-        self.mage_project = mage_project
 
         self._project_info = self._get_project()
         self._flow_name = (
             self._project_info["flow_name"] if self._project_info else name
         )
 
-        # Runtime provider info
         self._metadata_type = metadata.TYPE
         self._datastore_type = flow_datastore.TYPE
         self._datastore_root = getattr(flow_datastore, "datastore_root", None) or ""
-        self._environment_type = environment.TYPE
-        self._event_logger_type = event_logger.TYPE
-        self._monitor_type = monitor.TYPE
-
-        # Capture compile-time config values
         self._flow_config_value = self._extract_flow_config_value(flow)
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Helpers: flow metadata and environment
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -120,7 +148,6 @@ class MageCompiler:
                         return OmegaConf.to_container(value, resolve=True)
                 except ImportError:
                     pass
-                # Try direct serialization; if it fails, convert via repr
                 try:
                     json.dumps(value)
                     return value
@@ -170,16 +197,9 @@ class MageCompiler:
         return flow_name_to_pipeline_uuid(self._flow_name)
 
     def _get_parameters(self) -> Dict[str, Any]:
-        """Return a dict of Metaflow Parameters (excludes Config objects) from the flow.
-
-        Config objects are handled separately via METAFLOW_FLOW_CONFIG_VALUE and must NOT
-        be passed as CLI args to `metaflow init` — they are not writable CLI options in
-        the same way as Parameters.
-        """
+        """Return a dict of Metaflow Parameters (excludes Config objects) from the flow."""
         params = {}
         for var, param in self.flow._get_parameters():
-            # Skip Config parameters — they are passed via METAFLOW_FLOW_CONFIG_VALUE,
-            # not as individual --<name> CLI args to the init command.
             if getattr(param, "IS_CONFIG_PARAMETER", False):
                 continue
             default = None
@@ -199,20 +219,13 @@ class MageCompiler:
         """Build the environment variables dict for step subprocesses."""
         env = {}
 
-        # Metadata and datastore config
         env["METAFLOW_DEFAULT_METADATA"] = self._metadata_type
         env["METAFLOW_DEFAULT_DATASTORE"] = self._datastore_type
         if self._datastore_root:
-            # METAFLOW_DATASTORE_SYSROOT_LOCAL should be the PARENT of the .metaflow dir.
-            # When the local datastore is initialized, it sets datastore_root to
-            # <SYSROOT>/.metaflow, so we need to pass the parent to the subprocess.
-            import os as _os
-            sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
-            if sysroot:
-                env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
-            else:
-                # Derive from datastore_root by going up one level from .metaflow
-                env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = _os.path.dirname(self._datastore_root)
+            env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = (
+                os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+                or os.path.dirname(self._datastore_root)
+            )
 
         # Forward key Metaflow env vars from compile-time environment
         for key, val in os.environ.items():
@@ -223,18 +236,21 @@ class MageCompiler:
             ):
                 env[key] = val
 
-        # Cap.CONFIG_EXPR: inject compile-time config value
         if self._flow_config_value is not None:
             env["METAFLOW_FLOW_CONFIG_VALUE"] = self._flow_config_value
 
-        # Inject username so Metaflow can identify the user inside the container
-        # (Docker containers often have no USER/USERNAME env var set).
         if self.username:
             env.setdefault("USER", self.username)
             env.setdefault("USERNAME", self.username)
             env.setdefault("METAFLOW_USER", self.username)
 
         return env
+
+    def _find_step_obj(self, step_node):
+        """Look up the Step object for a graph node (or None)."""
+        return next(
+            (s for s in self.flow if s.name == step_node.name), None
+        )
 
     def _build_step_env_vars(self, step_node) -> Dict[str, str]:
         """Build env vars for a specific step, including @environment decorator vars.
@@ -243,120 +259,283 @@ class MageCompiler:
         called by Metaflow's local runtime. Since Mage calls step subprocesses
         directly (not through the runtime), we must extract and evaluate @environment
         vars at compile time and inject them into the step's block environment.
-
-        config_expr values are evaluated via str() which uses the current config
-        context (populated at compile time via METAFLOW_CLICK_API_PROCESS_CONFIG=1).
         """
         env = {}
-        # Find @environment decorator for this step
-        step_obj = next(
-            (s for s in self.flow if s.name == step_node.name), None
-        )
+        step_obj = self._find_step_obj(step_node)
         if step_obj is not None:
             for deco in step_obj.decorators:
                 if deco.name == "environment":
                     for key, value in deco.attributes.get("vars", {}).items():
                         try:
-                            # str() evaluates config_expr objects and descriptor values
                             env[key] = str(value)
                         except Exception:
                             pass
         return env
 
     def _get_max_user_code_retries(self, step_node) -> int:
-        """Extract max retry count from step's @retry decorator.
-
-        Returns 0 if no @retry decorator is present.
-        """
-        step_obj = next(
-            (s for s in self.flow if s.name == step_node.name), None
-        )
+        """Extract max retry count from step's @retry decorator (0 if absent)."""
+        step_obj = self._find_step_obj(step_node)
         if step_obj is not None:
             for deco in step_obj.decorators:
                 if deco.name == "retry":
                     return int(deco.attributes.get("times", 3))
         return 0
 
-    def _build_step_cmd_parts(
+    def _get_parent_step(self, step_node) -> str:
+        """Return the first parent step name, or empty string if none."""
+        return list(step_node.in_funcs)[0] if step_node.in_funcs else ""
+
+    def _get_nested_foreach_extras(self, step_name: str, step_node) -> Tuple[str, str]:
+        """Return (read_code, return_extra) for a foreach body that is also a foreach step."""
+        if step_node.type == "foreach":
+            return (
+                self._build_foreach_count_reader_loop(step_name),
+                ', "nested_foreach_counts": nested_foreach_counts',
+            )
+        return ("", "")
+
+    @staticmethod
+    def _format_env_lines(env_dict: Dict[str, str]) -> str:
+        """Format an env dict as indented assignment lines for generated block code."""
+        return "\n".join(
+            "    env[%r] = %r" % (k, v) for k, v in sorted(env_dict.items())
+        )
+
+    @staticmethod
+    def _make_block_dict(name: str, upstream: List[str], content: str) -> Dict[str, Any]:
+        """Build a Mage block definition dict."""
+        return {
+            "name": name,
+            "type": "custom",
+            "language": "python",
+            "upstream_blocks": upstream,
+            "content": content,
+        }
+
+    # ------------------------------------------------------------------
+    # Code generation: shared fragments
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _render_upstream_parsing(mode="simple"):
+        """Return code that parses run_id (and optionally foreach counts) from upstream output.
+
+        Modes: "simple" (run_id only), "foreach" (+foreach_count), "nested" (+nested_foreach_counts).
+        """
+        lines = [
+            '    upstream_output = args[0] if args else {}',
+            '    if isinstance(upstream_output, dict):',
+            '        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")',
+        ]
+        if mode == "nested":
+            lines += [
+                '        foreach_count = int(upstream_output.get("foreach_count", 1))',
+                '        nested_foreach_counts = upstream_output.get("nested_foreach_counts", [1] * foreach_count)',
+            ]
+        elif mode == "foreach":
+            lines += [
+                '        foreach_count = int(upstream_output.get("foreach_count", 1))',
+            ]
+        lines += [
+            '    else:',
+            '        run_id = str(upstream_output) if upstream_output else None',
+        ]
+        if mode == "nested":
+            lines += [
+                '        foreach_count = 1',
+                '        nested_foreach_counts = [1]',
+            ]
+        elif mode == "foreach":
+            lines += [
+                '        foreach_count = 1',
+            ]
+        lines += [
+            '',
+            '    if not run_id:',
+            '        raise RuntimeError("No run_id found from upstream block output")',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _render_block_preamble(
         self,
         step_name: str,
-        extra_args: Optional[List[str]] = None,
-    ) -> List[str]:
-        """Build the step command argument list (without python interpreter prefix)."""
-        cmd = [
-            self.flow_file,
-            "--no-pylint",
-            "--quiet",
-            "--metadata", self._metadata_type,
-            "--datastore", self._datastore_type,
+        docstring: str,
+        env_lines: str,
+        top_cmd_list: str,
+        max_retries: int,
+        upstream_parsing: str,
+    ) -> str:
+        """Return the shared preamble used by all step block templates.
+
+        Includes: header, @custom decorator, function def, upstream parsing,
+        env setup, and top_cmd assignment.
+        """
+        return '''{header}
+@custom
+def run_{step_name}(*args, **kwargs):
+    """{docstring}"""
+{upstream_parsing}
+    max_retries = {max_retries}
+
+    env = os.environ.copy()
+{env_lines}
+    env["MF_RUN_ID"] = run_id
+
+    top_cmd = {top_cmd_list}
+'''.format(
+            header=_BLOCK_HEADER,
+            step_name=step_name,
+            docstring=docstring,
+            upstream_parsing=upstream_parsing,
+            max_retries=max_retries,
+            env_lines=env_lines,
+            top_cmd_list=top_cmd_list,
+        )
+
+    def _build_cmd_lists(self, step_name: str) -> Tuple[str, str]:
+        """Build the top-level and step-level command list strings for code generation.
+
+        Returns (top_cmd_list, step_cmd_list) as Python source code strings.
+        """
+        top_parts = [
+            "sys.executable",
+            repr(self.flow_file),
+            '"--no-pylint"',
+            '"--quiet"',
+            '"--metadata"', repr(self._metadata_type),
+            '"--datastore"', repr(self._datastore_type),
         ]
 
         if self._datastore_root:
-            cmd += ["--datastore-root", self._datastore_root]
+            top_parts += ['"--datastore-root"', repr(self._datastore_root)]
 
         if self.namespace:
-            cmd += ["--namespace", self.namespace]
+            top_parts += ['"--namespace"', repr(self.namespace)]
 
         for with_deco in self.with_decorators:
-            cmd += ["--with", with_deco]
+            top_parts += ['"--with"', repr(with_deco)]
 
-        # Cap.PROJECT_BRANCH: forward --branch to every step subprocess
         if self.branch:
-            cmd += ["--branch", self.branch]
+            top_parts += ['"--branch"', repr(self.branch)]
 
-        cmd += ["step", step_name]
-        # --tag is a step-level option (not top-level)
+        step_parts = [
+            '"step"', repr(step_name),
+            '"--run-id"', 'run_id',
+            '"--task-id"', 'task_id',
+            '"--retry-count"', 'str(retry_count)',
+        ]
+
         for tag in self.tags:
-            cmd += ["--tag", tag]
-        cmd += ["--run-id", "{{{{ env_vars.MF_RUN_ID }}}}"]
-        cmd += ["--task-id", "{{{{ env_vars.MF_TASK_ID_PREFIX }}}}_{step_name}".format(step_name=step_name)]
+            step_parts += ['"--tag"', repr(tag)]
 
-        if extra_args:
-            cmd += extra_args
+        top_cmd_list = "[\n        %s,\n    ]" % ",\n        ".join(top_parts)
+        step_cmd_list = "[\n        %s,\n    ]" % ",\n        ".join(step_parts)
+        return top_cmd_list, step_cmd_list
 
-        return cmd
+    def _build_foreach_count_reader_single(self, step_name: str) -> str:
+        """Return code that reads _foreach_num_splits for a single task.
 
-    def _render_block_content(
-        self,
-        step_name: str,
-        step_node,
-        is_init: bool = False,
-    ) -> str:
-        """Generate the Python content for a Mage custom block."""
-        env_vars = self._build_env_vars()
-        env_lines = "\n".join(
-            "    env[%r] = %r" % (k, v) for k, v in sorted(env_vars.items())
+        Used after a foreach-initiating step to determine how many items it produced.
+        """
+        return (
+            '\n'
+            '    # Cap.FOREACH_COUNT: read _foreach_num_splits via fresh subprocess\n'
+            '    foreach_count = 1\n'
+            '    try:\n'
+            '        _sysroot = env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")\n'
+            '        _fc_result = subprocess.run(\n'
+            '            [sys.executable, "-c", r"""%s""",\n'
+            '                run_id, %s, task_id, _sysroot, %r],\n'
+            '            env=env, capture_output=True, text=True\n'
+            '        )\n'
+            '        _out = _fc_result.stdout.strip()\n'
+            '        if _out.isdigit():\n'
+            '            foreach_count = int(_out)\n'
+            '            print("Foreach step %s:", foreach_count, "items")\n'
+            '    except Exception as _e:\n'
+            '        print("Warning: foreach_count error:", _e)\n'
+        ) % (
+            _FOREACH_NUM_SPLITS_READER_SCRIPT,
+            repr(self.name),
+            step_name,
+            step_name,
         )
 
-        if is_init:
-            return self._render_init_block_content(env_lines)
+    def _build_foreach_count_reader_loop(self, step_name: str) -> str:
+        """Return code that reads _foreach_num_splits per foreach body task.
 
-        return self._render_step_block_content(step_name, step_node, env_lines)
+        Used when a foreach body step is ALSO a foreach step (nested foreach).
+        Iterates over all body tasks and builds a nested_foreach_counts list.
+        """
+        return (
+            '\n'
+            '    # Read _foreach_num_splits from each body task for nested foreach\n'
+            '    nested_foreach_counts = []\n'
+            '    for _nfc_i in range(foreach_count):\n'
+            '        _nfc_task_id = run_id + "-" + %r + "-" + str(_nfc_i)\n'
+            '        _nfc_count = 1\n'
+            '        try:\n'
+            '            _sysroot = env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")\n'
+            '            _nfc_result = subprocess.run(\n'
+            '                [sys.executable, "-c", r"""%s""",\n'
+            '                    run_id, %s, _nfc_task_id, _sysroot, %r],\n'
+            '                env=env, capture_output=True, text=True\n'
+            '            )\n'
+            '            _nfc_out = _nfc_result.stdout.strip()\n'
+            '            if _nfc_out.isdigit():\n'
+            '                _nfc_count = int(_nfc_out)\n'
+            '        except Exception as _e:\n'
+            '            print("Warning: nested foreach_count error for task %%s: %%s" %% (_nfc_task_id, _e))\n'
+            '        nested_foreach_counts.append(_nfc_count)\n'
+            '        print("Nested foreach: %%s task %%d has %%d items" %% (%r, _nfc_i, _nfc_count))\n'
+        ) % (step_name, _FOREACH_NUM_SPLITS_READER_SCRIPT, repr(self.name), step_name, step_name)
+
+    def _build_input_paths_code(self, step_name: str, step_node) -> str:
+        """Return Python code fragment that computes `input_paths` for a step."""
+        if step_name == "start":
+            return (
+                "    # start step reads from _parameters artifact created by init\n"
+                '    input_paths = run_id + "/_parameters/" + params_task_id\n'
+            )
+
+        parents = list(step_node.in_funcs) if step_node.in_funcs else []
+        if not parents:
+            return "    input_paths = None\n"
+
+        if len(parents) == 1:
+            parent = parents[0]
+            if step_node.type == "join":
+                return (
+                    "    # foreach join: gather all body task outputs\n"
+                    "    foreach_count = int(upstream_output.get('foreach_count', 1)) if isinstance(upstream_output, dict) else 1\n"
+                    "    input_paths = ','.join(\n"
+                    "        run_id + '/' + %r + '/' + run_id + '-' + %r + '-' + str(i)\n"
+                    "        for i in range(foreach_count)\n"
+                    "    )\n"
+                ) % (parent, parent)
+            return '    input_paths = run_id + "/" + %r + "/" + task_id\n' % parent
+
+        paths = " + \",\" + ".join(
+            'run_id + "/" + %r + "/" + task_id' % p for p in parents
+        )
+        return "    input_paths = %s\n" % paths
+
+    # ------------------------------------------------------------------
+    # Code generation: block renderers
+    # ------------------------------------------------------------------
 
     def _render_init_block_content(self, env_lines: str) -> str:
         """Render the init block that creates the Metaflow run."""
-        # Build --tag args for the init command
-        tag_args = ""
-        for tag in self.tags:
-            tag_args += '        "--tag", %r,\n' % tag
+        tag_args = "".join('        "--tag", %r,\n' % tag for tag in self.tags)
 
-        # Build parameter names list for passing flow Parameters from pipeline variables
         params = self._get_parameters()
         param_names_repr = repr(list(params.keys()))
 
         return '''import hashlib
-import os
-import subprocess
-import sys
-
-if 'custom' not in globals():
-    from mage_ai.data_preparation.decorators import custom
-
-
+{header}
 @custom
 def metaflow_init(*args, **kwargs):
     """Initialize a Metaflow run: compute run_id and call `metaflow init`."""
-    # Compute a stable run_id from the Mage pipeline_run_id
     pipeline_run_id = str(kwargs.get('pipeline_run_id', 'unknown'))
     run_id = "mage-" + hashlib.md5(pipeline_run_id.encode()).hexdigest()[:16]
 
@@ -365,15 +544,9 @@ def metaflow_init(*args, **kwargs):
     env["MF_RUN_ID"] = run_id
     env["MF_PIPELINE_RUN_ID"] = pipeline_run_id
 
-    # Cap.PARAMETERS: pass flow Parameters from Mage pipeline variables to init command
-    # Mage passes pipeline variables (set at trigger time) via kwargs.
-    # We forward them as --<param_name> <value> CLI args to `metaflow init`.
+    # Pass flow Parameters from Mage pipeline variables to init command
     param_names = {param_names_repr}
     param_args = []
-    # Mage may expose pipeline-run variables in different ways depending on version:
-    #   1. Flat in kwargs directly (most common: global_vars merged in)
-    #   2. Nested under kwargs['variables'] (older API path)
-    # We check BOTH sources for each param so we cover all Mage versions.
     _MAGE_INTERNAL_KEYS = {{
         'pipeline_run_id', 'context', 'block_uuid', 'event',
         'configuration', 'spark', 'logger', 'run_started_at',
@@ -383,14 +556,12 @@ def metaflow_init(*args, **kwargs):
     }}
     _nested_vars = kwargs.get('variables') or {{}}
     for pname in param_names:
-        # Priority: nested variables dict > direct kwarg
         val = _nested_vars.get(pname)
         if val is None:
             val = kwargs.get(pname)
         if val is not None and pname not in _MAGE_INTERNAL_KEYS:
             param_args += ["--" + pname, str(val)]
 
-    # Initialize the Metaflow run (creates _parameters artifact, registers run)
     cmd = [
         sys.executable,
         {flow_file!r},
@@ -412,6 +583,7 @@ def metaflow_init(*args, **kwargs):
     print("Metaflow run initialized: " + run_id)
     return {{"mf_run_id": run_id, "pipeline_run_id": pipeline_run_id}}
 '''.format(
+            header=_BLOCK_HEADER,
             env_lines=env_lines,
             flow_file=self.flow_file,
             metadata_type=self._metadata_type,
@@ -424,158 +596,92 @@ def metaflow_init(*args, **kwargs):
             ),
         )
 
-    def _build_input_paths_code(self, step_name: str, step_node) -> str:
-        """Return Python code fragment that computes `input_paths` for a step.
+    def _render_foreach_body_block(
+        self,
+        step_name: str,
+        step_node,
+        env_lines: str,
+        top_cmd_list: str,
+        step_cmd_list: str,
+    ) -> str:
+        """Render a foreach body block that runs the step once per foreach item."""
+        parent_step = self._get_parent_step(step_node)
+        max_retries = self._get_max_user_code_retries(step_node)
+        foreach_read_code, foreach_return_extra = self._get_nested_foreach_extras(step_name, step_node)
 
-        For the `start` step: use run_id + "/_parameters/" + params_task_id
-        For all other steps: run_id + "/" + each_parent_step + "/" + "1"
-        For foreach join steps: build comma-separated paths from all foreach body tasks
-        """
-        if step_name == "start":
-            return (
-                "    # start step reads from _parameters artifact created by init\n"
-                '    input_paths = run_id + "/_parameters/" + params_task_id\n'
-            )
-
-        # Collect parent step names
-        parents = list(step_node.in_funcs) if step_node.in_funcs else []
-        if not parents:
-            return "    input_paths = None\n"
-
-        if len(parents) == 1:
-            parent = parents[0]
-            if step_node.type == "join":
-                # Foreach join: input from all foreach body tasks
-                # We track foreach_count from the upstream foreach step output
-                return (
-                    "    # foreach join: gather all body task outputs\n"
-                    "    foreach_count = int(upstream_output.get('foreach_count', 1)) if isinstance(upstream_output, dict) else 1\n"
-                    "    input_paths = ','.join(\n"
-                    "        run_id + '/' + %r + '/' + run_id + '-' + %r + '-' + str(i)\n"
-                    "        for i in range(foreach_count)\n"
-                    "    )\n"
-                ) % (parent, parent)
-            return '    input_paths = run_id + "/" + %r + "/" + task_id\n' % parent
-
-        # Multiple parents (join from split/branch): comma-separated
-        paths = " + \",\" + ".join(
-            'run_id + "/" + %r + "/" + task_id' % p for p in parents
+        preamble = self._render_block_preamble(
+            step_name,
+            "Execute Metaflow foreach body step: %s (runs once per foreach item)" % step_name,
+            env_lines, top_cmd_list, max_retries,
+            self._render_upstream_parsing("foreach"),
         )
-        return "    input_paths = %s\n" % paths
 
-    def _build_foreach_count_reader_inline(self, step_name: str) -> str:
-        """Return code that reads _foreach_num_splits per foreach body task.
+        return '''{preamble}
+    # Run the step once per foreach item
+    for split_index in range(foreach_count):
+        task_id = run_id + "-" + {step_name_repr} + "-" + str(split_index)
+        input_paths = run_id + "/" + {parent_step_repr} + "/mage-1"
+        for retry_count in range(max_retries + 1):
+            step_cmd = {step_cmd_list}
+            step_cmd += ["--split-index", str(split_index)]
+            step_cmd += ["--input-paths", input_paths]
+            cmd = top_cmd + step_cmd
 
-        This is used when a foreach body step is ALSO a foreach step (nested foreach).
-        After all body iterations complete, reads each task's _foreach_num_splits
-        and builds a nested_foreach_counts list.
-        """
-        return (
-            '\n'
-            '    # Read _foreach_num_splits from each body task for nested foreach\n'
-            '    nested_foreach_counts = []\n'
-            '    for _nfc_i in range(foreach_count):\n'
-            '        _nfc_task_id = run_id + "-" + %r + "-" + str(_nfc_i)\n'
-            '        _nfc_count = 1\n'
-            '        try:\n'
-            '            _sysroot = env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")\n'
-            '            _nfc_result = subprocess.run(\n'
-            '                [sys.executable, "-c", r"""\n'
-            'import json, gzip, pickle, os, sys\n'
-            '_r = sys.argv[1]; _f = sys.argv[2]; _t = sys.argv[3]\n'
-            '_hint = sys.argv[4] if len(sys.argv) > 4 else ""\n'
-            '_step = sys.argv[5] if len(sys.argv) > 5 else "start"\n'
-            'import os as _os\n'
-            '_candidates = [_hint, "/home/runner", "/root", _os.environ.get("HOME",""), "/tmp"]\n'
-            '_p = None\n'
-            'for _cand in _candidates:\n'
-            '    if not _cand: continue\n'
-            '    _dir = _os.path.join(_cand, ".metaflow", _f, _r, _step, _t)\n'
-            '    if _os.path.isdir(_dir):\n'
-            '        _files = sorted([x for x in _os.listdir(_dir) if x.endswith(".data.json")], reverse=True)\n'
-            '        if _files:\n'
-            '            _p = _os.path.join(_dir, _files[0]); _mf_root = _os.path.join(_cand, ".metaflow"); break\n'
-            'if not _p: sys.exit(0)\n'
-            '_obj = json.load(open(_p)).get("objects", {})\n'
-            '_key = _obj.get("_foreach_num_splits")\n'
-            'if not _key: sys.exit(0)\n'
-            '_bp = _os.path.join(_mf_root, _f, "data", _key[:2], _key)\n'
-            '_blob = open(_bp, "rb").read()\n'
-            'try: print(int(pickle.loads(gzip.decompress(_blob))))\n'
-            'except: print(int(pickle.loads(_blob)))\n'
-            '""",\n'
-            '                    run_id, %s, _nfc_task_id, _sysroot, %r],\n'
-            '                env=env, capture_output=True, text=True\n'
-            '            )\n'
-            '            _nfc_out = _nfc_result.stdout.strip()\n'
-            '            if _nfc_out.isdigit():\n'
-            '                _nfc_count = int(_nfc_out)\n'
-            '        except Exception as _e:\n'
-            '            print("Warning: nested foreach_count error for task %%s: %%s" %% (_nfc_task_id, _e))\n'
-            '        nested_foreach_counts.append(_nfc_count)\n'
-            '        print("Nested foreach: %%s task %%d has %%d items" %% (%r, _nfc_i, _nfc_count))\n'
-        ) % (step_name, repr(self.name), step_name, step_name)
+            print("Running {step_name} split_index=%d retry=%d (task_id=%s)" % (split_index, retry_count, task_id))
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            if result.returncode == 0:
+                break
+            if retry_count < max_retries:
+                print("Step {step_name} split_index=%d failed on attempt %d, retrying..." % (split_index, retry_count))
+                if result.stderr:
+                    print("STDERR:", result.stderr[-2000:])
+                continue
+            print("STDOUT:", result.stdout[-4000:])
+            print("STDERR:", result.stderr[-4000:])
+            raise RuntimeError(
+                "Metaflow step {step_name!r} split_index=%d failed (exit %d): %s"
+                % (split_index, result.returncode, result.stderr[-500:])
+            )
+        if result.stdout:
+            print("STDOUT:", result.stdout[-2000:])
+{foreach_read_code}
+    print("Step {step_name} completed all %d foreach items" % foreach_count)
+    return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"{foreach_return_extra}}}
+'''.format(
+            preamble=preamble,
+            step_name=step_name,
+            step_name_repr=repr(step_name),
+            parent_step_repr=repr(parent_step),
+            step_cmd_list=step_cmd_list,
+            foreach_read_code=foreach_read_code,
+            foreach_return_extra=foreach_return_extra,
+        )
 
     def _render_nested_foreach_body(
         self,
         step_name: str,
         step_node,
-        parent_step: str,
         env_lines: str,
         top_cmd_list: str,
         step_cmd_list: str,
-        max_retries: int,
-        is_also_foreach: bool,
     ) -> str:
         """Render a nested foreach body block (e.g., 'inner' step).
 
-        The parent step is itself a foreach body, creating tasks like
-        run_id-parent-0, run_id-parent-1, etc. This block must iterate
+        The parent step is itself a foreach body, so this block iterates
         over all (outer_i, inner_j) combinations.
         """
-        # If this nested body is also a foreach step, we need to read
-        # _foreach_num_splits from each task too.
-        nested_read_code = ""
-        nested_return_extra = ""
-        if is_also_foreach:
-            # 3-level nesting not supported yet; this handles 2-level correctly
-            nested_read_code = self._build_foreach_count_reader_inline(step_name)
-            nested_return_extra = ', "nested_foreach_counts": nested_foreach_counts'
+        parent_step = self._get_parent_step(step_node)
+        max_retries = self._get_max_user_code_retries(step_node)
+        nested_read_code, nested_return_extra = self._get_nested_foreach_extras(step_name, step_node)
 
-        return '''import os
-import subprocess
-import sys
+        preamble = self._render_block_preamble(
+            step_name,
+            "Execute nested foreach body step: %s" % step_name,
+            env_lines, top_cmd_list, max_retries,
+            self._render_upstream_parsing("nested"),
+        )
 
-if 'custom' not in globals():
-    from mage_ai.data_preparation.decorators import custom
-
-
-@custom
-def run_{step_name}(*args, **kwargs):
-    """Execute nested foreach body step: {step_name}"""
-    # Get run_id, outer foreach_count, and per-outer inner counts from upstream
-    upstream_output = args[0] if args else {{}}
-    if isinstance(upstream_output, dict):
-        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")
-        foreach_count = int(upstream_output.get("foreach_count", 1))
-        nested_foreach_counts = upstream_output.get("nested_foreach_counts", [1] * foreach_count)
-    else:
-        run_id = str(upstream_output) if upstream_output else None
-        foreach_count = 1
-        nested_foreach_counts = [1]
-
-    if not run_id:
-        raise RuntimeError("No run_id found from upstream block output")
-
-    params_task_id = "mage-params"
-    max_retries = {max_retries}
-
-    env = os.environ.copy()
-{env_lines}
-    env["MF_RUN_ID"] = run_id
-
-    top_cmd = {top_cmd_list}
-
+        return '''{preamble}
     # Nested foreach: iterate over all (outer_i, inner_j) combinations
     for outer_i in range(foreach_count):
         inner_count = nested_foreach_counts[outer_i] if outer_i < len(nested_foreach_counts) else 1
@@ -610,12 +716,10 @@ def run_{step_name}(*args, **kwargs):
     print("Step {step_name} completed all nested foreach items")
     return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "nested_foreach_counts": nested_foreach_counts, "status": "success"{nested_return_extra}}}
 '''.format(
+            preamble=preamble,
             step_name=step_name,
             step_name_repr=repr(step_name),
             parent_step_repr=repr(parent_step),
-            max_retries=max_retries,
-            env_lines=env_lines,
-            top_cmd_list=top_cmd_list,
             step_cmd_list=step_cmd_list,
             nested_read_code=nested_read_code,
             nested_return_extra=nested_return_extra,
@@ -625,55 +729,29 @@ def run_{step_name}(*args, **kwargs):
         self,
         step_name: str,
         step_node,
-        parent_step: str,
         env_lines: str,
         top_cmd_list: str,
         step_cmd_list: str,
-        max_retries: int,
     ) -> str:
-        """Render a join block inside a nested foreach (e.g., 'inner_join').
+        """Render a join block inside a nested foreach.
 
-        This join runs once per outer foreach iteration, gathering all inner
-        body tasks for that iteration.
+        Runs once per outer foreach iteration, gathering all inner body tasks.
         """
-        return '''import os
-import subprocess
-import sys
+        parent_step = self._get_parent_step(step_node)
+        max_retries = self._get_max_user_code_retries(step_node)
 
-if 'custom' not in globals():
-    from mage_ai.data_preparation.decorators import custom
+        preamble = self._render_block_preamble(
+            step_name,
+            "Execute nested foreach join step: %s" % step_name,
+            env_lines, top_cmd_list, max_retries,
+            self._render_upstream_parsing("nested"),
+        )
 
-
-@custom
-def run_{step_name}(*args, **kwargs):
-    """Execute nested foreach join step: {step_name}"""
-    upstream_output = args[0] if args else {{}}
-    if isinstance(upstream_output, dict):
-        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")
-        foreach_count = int(upstream_output.get("foreach_count", 1))
-        nested_foreach_counts = upstream_output.get("nested_foreach_counts", [1] * foreach_count)
-    else:
-        run_id = str(upstream_output) if upstream_output else None
-        foreach_count = 1
-        nested_foreach_counts = [1]
-
-    if not run_id:
-        raise RuntimeError("No run_id found from upstream block output")
-
-    params_task_id = "mage-params"
-    max_retries = {max_retries}
-
-    env = os.environ.copy()
-{env_lines}
-    env["MF_RUN_ID"] = run_id
-
-    top_cmd = {top_cmd_list}
-
+        return '''{preamble}
     # Nested foreach join: run join once per outer iteration
     for outer_i in range(foreach_count):
         inner_count = nested_foreach_counts[outer_i] if outer_i < len(nested_foreach_counts) else 1
         task_id = run_id + "-" + {step_name_repr} + "-" + str(outer_i)
-        # Gather input_paths from all inner body tasks for this outer iteration
         input_paths = ",".join(
             run_id + "/" + {parent_step_repr} + "/" + run_id + "-" + {parent_step_repr} + "-" + str(outer_i) + "-" + str(j)
             for j in range(inner_count)
@@ -704,278 +782,45 @@ def run_{step_name}(*args, **kwargs):
     print("Step {step_name} completed all %d join iterations" % foreach_count)
     return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"}}
 '''.format(
+            preamble=preamble,
             step_name=step_name,
             step_name_repr=repr(step_name),
             parent_step_repr=repr(parent_step),
-            max_retries=max_retries,
-            env_lines=env_lines,
-            top_cmd_list=top_cmd_list,
             step_cmd_list=step_cmd_list,
         )
 
-    def _render_step_block_content(
+    def _render_regular_step_block(
         self,
         step_name: str,
         step_node,
         env_lines: str,
+        top_cmd_list: str,
+        step_cmd_list: str,
     ) -> str:
-        """Render a block that runs one Metaflow step as a subprocess."""
-        # Detect if this is a foreach body step:
-        # is_inside_foreach=True and at least one parent has type "foreach"
-        is_foreach_body = (
-            getattr(step_node, "is_inside_foreach", False)
-            and step_node.type not in ("join",)
-        )
-
-        # Build the top-level command parts (before "step" subcommand)
-        top_parts = [
-            "sys.executable",
-            repr(self.flow_file),
-            '"--no-pylint"',
-            '"--quiet"',
-            '"--metadata"', repr(self._metadata_type),
-            '"--datastore"', repr(self._datastore_type),
-        ]
-
-        if self._datastore_root:
-            top_parts += ['"--datastore-root"', repr(self._datastore_root)]
-
-        if self.namespace:
-            top_parts += ['"--namespace"', repr(self.namespace)]
-
-        for with_deco in self.with_decorators:
-            top_parts += ['"--with"', repr(with_deco)]
-
-        # Cap.PROJECT_BRANCH: --branch must be in every step command
-        if self.branch:
-            top_parts += ['"--branch"', repr(self.branch)]
-
-        step_parts = [
-            '"step"', repr(step_name),
-            '"--run-id"', 'run_id',
-            '"--task-id"', 'task_id',
-            '"--retry-count"', 'str(retry_count)',
-        ]
-
-        # --tag is a step-level option (passed after "step" subcommand), not top-level
-        for tag in self.tags:
-            step_parts += ['"--tag"', repr(tag)]
-
+        """Render a regular (non-foreach-body) step block."""
         input_paths_code = self._build_input_paths_code(step_name, step_node)
+        max_retries = self._get_max_user_code_retries(step_node)
 
-        top_cmd_list = "[\n        %s,\n    ]" % ",\n        ".join(top_parts)
-        step_cmd_list = "[\n        %s,\n    ]" % ",\n        ".join(step_parts)
-
-        if is_foreach_body:
-            # Cap.FOREACH_SPLIT_INDEX: foreach body steps must run once per item.
-            # The foreach step output contains foreach_count; we loop over all items,
-            # running the step subprocess with --split-index <i> and a per-item task_id.
-            # The join block expects task_ids of the form: run_id + '-' + step_name + '-' + str(i)
-
-            parent_step = list(step_node.in_funcs)[0] if step_node.in_funcs else ""
-            max_retries = self._get_max_user_code_retries(step_node)
-            is_also_foreach = (step_node.type == "foreach")
-
-            # Detect nested foreach: parent is itself a foreach body
-            split_parents = getattr(step_node, "split_parents", [])
-            is_nested_body = len(split_parents) > 1
-
-            # Determine how the parent task_id is formed.
-            # For non-nested: parent task_id is "mage-1" (the fixed id for regular steps).
-            # For nested: parent is a foreach body, so its task_ids are
-            #   run_id + "-" + parent_step + "-" + str(outer_i)
-            if is_nested_body:
-                return self._render_nested_foreach_body(
-                    step_name, step_node, parent_step, env_lines,
-                    top_cmd_list, step_cmd_list, max_retries, is_also_foreach,
-                )
-
-            # Build foreach_count reading code for steps that are ALSO foreach steps
-            # (e.g., "outer" in a nested foreach: it's a foreach body of "start" AND
-            # a foreach step that sets up its own foreach items).
-            foreach_read_code = ""
-            foreach_return_extra = ""
-            if is_also_foreach:
-                foreach_read_code = self._build_foreach_count_reader_inline(step_name)
-                foreach_return_extra = ', "nested_foreach_counts": nested_foreach_counts'
-
-            return '''import os
-import subprocess
-import sys
-
-if 'custom' not in globals():
-    from mage_ai.data_preparation.decorators import custom
-
-
-@custom
-def run_{step_name}(*args, **kwargs):
-    """Execute Metaflow foreach body step: {step_name} (runs once per foreach item)"""
-    # Get run_id and foreach_count from upstream block output
-    upstream_output = args[0] if args else {{}}
-    if isinstance(upstream_output, dict):
-        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")
-        foreach_count = int(upstream_output.get("foreach_count", 1))
-    else:
-        run_id = str(upstream_output) if upstream_output else None
-        foreach_count = 1
-
-    if not run_id:
-        raise RuntimeError("No run_id found from upstream block output")
-
-    params_task_id = "mage-params"
-    max_retries = {max_retries}
-
-    env = os.environ.copy()
-{env_lines}
-    env["MF_RUN_ID"] = run_id
-
-    top_cmd = {top_cmd_list}
-
-    # Cap.FOREACH_SPLIT_INDEX: run the step once per foreach item
-    for split_index in range(foreach_count):
-        # Per-item task_id: join block expects run_id + '-' + step_name + '-' + str(i)
-        task_id = run_id + "-" + {step_name_repr} + "-" + str(split_index)
-        # input_paths: parent foreach step task (task_id for parent is "mage-1")
-        input_paths = run_id + "/" + {parent_step_repr} + "/mage-1"
-        for retry_count in range(max_retries + 1):
-            step_cmd = {step_cmd_list}
-            step_cmd += ["--split-index", str(split_index)]
-            step_cmd += ["--input-paths", input_paths]
-            cmd = top_cmd + step_cmd
-
-            print("Running {step_name} split_index=%d retry=%d (task_id=%s)" % (split_index, retry_count, task_id))
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-            if result.returncode == 0:
-                break
-            if retry_count < max_retries:
-                print("Step {step_name} split_index=%d failed on attempt %d, retrying..." % (split_index, retry_count))
-                if result.stderr:
-                    print("STDERR:", result.stderr[-2000:])
-                continue
-            print("STDOUT:", result.stdout[-4000:])
-            print("STDERR:", result.stderr[-4000:])
-            raise RuntimeError(
-                "Metaflow step {step_name!r} split_index=%d failed (exit %d): %s"
-                % (split_index, result.returncode, result.stderr[-500:])
-            )
-        if result.stdout:
-            print("STDOUT:", result.stdout[-2000:])
-{foreach_read_code}
-    print("Step {step_name} completed all %d foreach items" % foreach_count)
-    return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"{foreach_return_extra}}}
-'''.format(
-                step_name=step_name,
-                step_name_repr=repr(step_name),
-                parent_step_repr=repr(parent_step),
-                max_retries=max_retries,
-                env_lines=env_lines,
-                top_cmd_list=top_cmd_list,
-                step_cmd_list=step_cmd_list,
-                foreach_read_code=foreach_read_code,
-                foreach_return_extra=foreach_return_extra,
-            )
-
-        # Detect nested foreach join: a join step inside a nested foreach
-        # (e.g., inner_join with split_parents=['start', 'outer'])
-        split_parents = getattr(step_node, "split_parents", [])
-        if step_node.type == "join" and len(split_parents) > 1:
-            parent_step = list(step_node.in_funcs)[0] if step_node.in_funcs else ""
-            max_retries = self._get_max_user_code_retries(step_node)
-            return self._render_nested_foreach_join(
-                step_name, step_node, parent_step, env_lines,
-                top_cmd_list, step_cmd_list, max_retries,
-            )
-
-        # For foreach steps, we need to read _foreach_num_splits after execution
         is_foreach_step = (step_node.type == "foreach")
         foreach_count_code = ""
         foreach_return_field = ""
         if is_foreach_step:
-            # Read _foreach_num_splits directly from the local datastore files.
-            # The subprocess uses the same env as the step subprocess, so paths match.
-            foreach_count_code = (
-                '\n'
-                '    # Cap.FOREACH_COUNT: read _foreach_num_splits via fresh subprocess\n'
-                '    foreach_count = 1\n'
-                '    try:\n'
-                '        _sysroot = env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")\n'
-                '        _fc_result = subprocess.run(\n'
-                '            [sys.executable, "-c", r"""\n'
-                'import json, gzip, pickle, os, sys\n'
-                '_r = sys.argv[1]; _f = sys.argv[2]; _t = sys.argv[3]\n'
-                '_hint = sys.argv[4] if len(sys.argv) > 4 else ""\n'
-                '_step = sys.argv[5] if len(sys.argv) > 5 else "start"\n'
-                'import os as _os\n'
-                '_candidates = [_hint, "/home/runner", "/root", _os.environ.get("HOME",""), "/tmp"]\n'
-                '_p = None\n'
-                'for _cand in _candidates:\n'
-                '    if not _cand: continue\n'
-                '    _dir = _os.path.join(_cand, ".metaflow", _f, _r, _step, _t)\n'
-                '    if _os.path.isdir(_dir):\n'
-                '        _files = sorted([x for x in _os.listdir(_dir) if x.endswith(".data.json")], reverse=True)\n'
-                '        if _files:\n'
-                '            _p = _os.path.join(_dir, _files[0]); _mf_root = _os.path.join(_cand, ".metaflow"); break\n'
-                'if not _p: sys.exit(0)\n'
-                '_obj = json.load(open(_p)).get("objects", {})\n'
-                '_key = _obj.get("_foreach_num_splits")\n'
-                'if not _key: sys.exit(0)\n'
-                '_bp = _os.path.join(_mf_root, _f, "data", _key[:2], _key)\n'
-                '_blob = open(_bp, "rb").read()\n'
-                'try: print(int(pickle.loads(gzip.decompress(_blob))))\n'
-                'except: print(int(pickle.loads(_blob)))\n'
-                '""",\n'
-                '                run_id, %s, task_id, _sysroot, %r],\n'
-                '            env=env, capture_output=True, text=True\n'
-                '        )\n'
-                '        _out = _fc_result.stdout.strip()\n'
-                '        if _out.isdigit():\n'
-                '            foreach_count = int(_out)\n'
-                '            print("Foreach step %s:", foreach_count, "items")\n'
-                '    except Exception as _e:\n'
-                '        print("Warning: foreach_count error:", _e)\n'
-            ) % (
-                repr(self.name),
-                step_name,
-                step_name,
-            )
+            foreach_count_code = self._build_foreach_count_reader_single(step_name)
             foreach_return_field = ', "foreach_count": foreach_count'
 
-        return '''import os
-import subprocess
-import sys
+        preamble = self._render_block_preamble(
+            step_name,
+            "Execute Metaflow step: %s" % step_name,
+            env_lines, top_cmd_list, max_retries,
+            self._render_upstream_parsing(),
+        )
 
-if 'custom' not in globals():
-    from mage_ai.data_preparation.decorators import custom
-
-
-@custom
-def run_{step_name}(*args, **kwargs):
-    """Execute Metaflow step: {step_name}"""
-    # Get run_id from upstream block output
-    upstream_output = args[0] if args else {{}}
-    if isinstance(upstream_output, dict):
-        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")
-    else:
-        run_id = str(upstream_output) if upstream_output else None
-
-    if not run_id:
-        raise RuntimeError("No run_id found from upstream block output")
-
-    params_task_id = "mage-params"  # task_id used in metaflow init (non-integer so metadata registers it)
-    task_id = "mage-1"  # non-integer task_id forces local metadata to create _self.json
-    # Cap.RETRY: in-block retry loop handles Metaflow @retry(times=N).
-    # Mage does not retry blocks by default, so we implement step-level retry
-    # within the generated block code, incrementing --retry-count each attempt.
-    max_retries = {max_retries}
-
-    env = os.environ.copy()
-{env_lines}
-    env["MF_RUN_ID"] = run_id
+        return '''{preamble}
+    params_task_id = "mage-params"
+    task_id = "mage-1"
 
     # Compute input_paths for this step
 {input_paths_code}
-    top_cmd = {top_cmd_list}
-
     for retry_count in range(max_retries + 1):
         step_cmd = {step_cmd_list}
         if input_paths:
@@ -1002,30 +847,65 @@ def run_{step_name}(*args, **kwargs):
 {foreach_count_code}
     return {{"run_id": run_id, "step": {step_name!r}, "status": "success"{foreach_return_field}}}
 '''.format(
+            preamble=preamble,
             step_name=step_name,
-            max_retries=self._get_max_user_code_retries(step_node),
-            env_lines=env_lines,
             input_paths_code=input_paths_code,
-            top_cmd_list=top_cmd_list,
             step_cmd_list=step_cmd_list,
             foreach_count_code=foreach_count_code,
             foreach_return_field=foreach_return_field,
         )
 
-    def _block_prefix(self) -> str:
-        """Short prefix derived from pipeline UUID for unique block naming.
+    def _render_step_block_content(
+        self,
+        step_name: str,
+        step_node,
+        env_lines: str,
+    ) -> str:
+        """Dispatch to the appropriate block renderer based on step type.
 
-        Mage stores all custom block code as shared project-level files:
-          /home/src/{project}/custom/{block_name}.py
-        Two pipelines sharing a block name (e.g. "metaflow_init") will
-        overwrite each other's code.  We prefix every block name with
-        a slug of the pipeline UUID to ensure isolation.
-
-        We use the first 12 chars to keep block names readable in the UI.
+        Step classification:
+        1. Nested foreach body: is_inside_foreach, not join, split_parents > 1
+        2. Foreach body: is_inside_foreach, not join
+        3. Nested foreach join: join with split_parents > 1
+        4. Regular step (including foreach initiators and simple joins)
         """
-        # Replace hyphens and dots with underscores; truncate to 12 chars
-        slug = self.pipeline_uuid.replace("-", "_").replace(".", "_")[:12]
-        return slug
+        top_cmd_list, step_cmd_list = self._build_cmd_lists(step_name)
+        split_parents = getattr(step_node, "split_parents", [])
+
+        is_foreach_body = (
+            getattr(step_node, "is_inside_foreach", False)
+            and step_node.type != "join"
+        )
+
+        if is_foreach_body:
+            if len(split_parents) > 1:
+                return self._render_nested_foreach_body(
+                    step_name, step_node, env_lines,
+                    top_cmd_list, step_cmd_list,
+                )
+            return self._render_foreach_body_block(
+                step_name, step_node, env_lines,
+                top_cmd_list, step_cmd_list,
+            )
+
+        if step_node.type == "join" and len(split_parents) > 1:
+            return self._render_nested_foreach_join(
+                step_name, step_node, env_lines,
+                top_cmd_list, step_cmd_list,
+            )
+
+        return self._render_regular_step_block(
+            step_name, step_node, env_lines,
+            top_cmd_list, step_cmd_list,
+        )
+
+    # ------------------------------------------------------------------
+    # Pipeline compilation
+    # ------------------------------------------------------------------
+
+    def _block_prefix(self) -> str:
+        """Short prefix derived from pipeline UUID for unique block naming."""
+        return self.pipeline_uuid[:12]
 
     def compile(self) -> List[Dict[str, Any]]:
         """Return a list of block dicts describing the Mage pipeline.
@@ -1034,73 +914,31 @@ def run_{step_name}(*args, **kwargs):
         """
         blocks = []
 
-        # Derive a pipeline-unique prefix to avoid block file collisions
         prefix = self._block_prefix()
         init_block_name = "%s%s" % (prefix, self.INIT_BLOCK_SUFFIX)
 
-        init_content = self._render_init_block_content(
-            "\n".join(
-                "    env[%r] = %r" % (k, v)
-                for k, v in sorted(self._build_env_vars().items())
-            )
-        )
-
-        blocks.append({
-            "name": init_block_name,
-            "type": "custom",
-            "language": "python",
-            "upstream_blocks": [],
-            "content": init_content,
-        })
-
-        # Build one block per step
         env_vars = self._build_env_vars()
-        env_lines = "\n".join(
-            "    env[%r] = %r" % (k, v) for k, v in sorted(env_vars.items())
-        )
+        env_lines = self._format_env_lines(env_vars)
 
-        # First pass: pre-populate step_to_block for ALL nodes so that upstream
-        # references are correct regardless of graph iteration order.
-        # (Graph may iterate in depth-first or reverse topological order.)
-        step_to_block = {init_block_name: init_block_name}
-        for node in self.graph:
-            step_to_block[node.name] = "%s_s_%s" % (prefix, node.name)
+        init_content = self._render_init_block_content(env_lines)
+        blocks.append(self._make_block_dict(init_block_name, [], init_content))
 
-        # Second pass: create blocks with correct upstream references
         for node in self.graph:
             step_name = node.name
             block_name = "%s_s_%s" % (prefix, step_name)
 
-            # Determine upstream blocks
             if step_name == "start":
                 upstream = [init_block_name]
             else:
-                upstream = [
-                    step_to_block.get(p, "%s_s_%s" % (prefix, p))
-                    for p in node.in_funcs
-                ]
+                upstream = ["%s_s_%s" % (prefix, p) for p in node.in_funcs]
 
-            # Merge global env vars with step-specific @environment decorator vars.
-            # @environment sets env vars via runtime_step_cli() which Mage doesn't call,
-            # so we evaluate them at compile time and inject directly into the block env.
             step_specific_env = self._build_step_env_vars(node)
             if step_specific_env:
-                merged_env = dict(env_vars)
-                merged_env.update(step_specific_env)
-                step_env_lines = "\n".join(
-                    "    env[%r] = %r" % (k, v) for k, v in sorted(merged_env.items())
-                )
+                step_env_lines = self._format_env_lines({**env_vars, **step_specific_env})
             else:
                 step_env_lines = env_lines
 
             content = self._render_step_block_content(step_name, node, step_env_lines)
-
-            blocks.append({
-                "name": block_name,
-                "type": "custom",
-                "language": "python",
-                "upstream_blocks": upstream,
-                "content": content,
-            })
+            blocks.append(self._make_block_dict(block_name, upstream, content))
 
         return blocks
