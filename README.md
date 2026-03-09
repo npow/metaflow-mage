@@ -1,36 +1,26 @@
 # metaflow-mage
 
-[![UX Tests](https://github.com/npow/metaflow-mage/actions/workflows/ux-tests.yml/badge.svg)](https://github.com/npow/metaflow-mage/actions/workflows/ux-tests.yml)
+[![CI](https://github.com/npow/metaflow-mage/actions/workflows/ux-tests.yml/badge.svg)](https://github.com/npow/metaflow-mage/actions/workflows/ux-tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/metaflow-mage)](https://pypi.org/project/metaflow-mage/)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/metaflow-mage)](https://pypi.org/project/metaflow-mage/)
 
-Deploy and run Metaflow flows as [Mage](https://docs.mage.ai) pipelines.
+Run any Metaflow flow as a Mage pipeline without rewriting your steps.
 
-`metaflow-mage` compiles any Metaflow flow into a Mage pipeline, letting you schedule, deploy,
-and monitor your pipelines through Mage while keeping all your existing Metaflow code unchanged.
+## The problem
 
-## How it works
+Mage is a modern data pipeline tool with a rich UI and flexible block model, but it has no native support for Metaflow's step graph, artifact store, or retry semantics. Teams that want Mage's notebook-style visibility must either re-implement their Metaflow flows as Mage blocks from scratch or give up Metaflow's lineage, versioning, and `@retry` behavior. There is no ready-made compiler that maps a Metaflow DAG to Mage blocks while keeping the full Metaflow runtime intact.
 
-Each Metaflow step becomes a Mage [custom block](https://docs.mage.ai/custom-blocks/overview).
-An `init` block runs first to create the Metaflow run and compute a stable `run_id` from the
-Mage pipeline run ID. Then each step block runs the step as a subprocess
-(`python flow.py step <step_name> --run-id ...`), passing artifacts through the Metaflow
-datastore rather than Mage block outputs. Block dependencies mirror Metaflow step dependencies.
-
-## Prerequisites
-
-A running Mage instance. The quickest way is Docker:
+## Quick start
 
 ```bash
-docker run -d -p 6789:6789 \
-  -v "$HOME:$HOME" \
-  -e REQUIRE_USER_AUTHENTICATION=0 \
-  mageai/mageai:latest mage start metaflow_project
+pip install metaflow-mage
+python flow.py mage create --mage-host http://localhost:6789
+python flow.py mage trigger --mage-host http://localhost:6789
+# Compiling HelloFlow to Mage pipeline...
+# Pipeline hello_flow deployed successfully.
+# Pipeline run started: http://localhost:6789/pipelines/hello_flow/runs/1
 ```
-
-The volume mount (`-v "$HOME:$HOME"`) is required so that Mage can execute your flow file at
-its absolute path and share the local Metaflow datastore with the test runner.
 
 ## Install
 
@@ -38,112 +28,93 @@ its absolute path and share the local Metaflow datastore with the test runner.
 pip install metaflow-mage
 ```
 
-Or from source:
+From source:
 
 ```bash
-git clone https://github.com/npow/metaflow-mage.git
+git clone https://github.com/npow/metaflow-mage
 cd metaflow-mage
-pip install -e ".[dev]"
+pip install -e .
 ```
 
-## Quick start
+## Usage
+
+**Deploy and run in one step:**
 
 ```bash
-# Compile and deploy to Mage, trigger a run, and wait for completion
-python my_flow.py mage run --mage-host http://localhost:6789
-
-# Just deploy (no run)
-python my_flow.py mage create --mage-host http://localhost:6789
-
-# Trigger a previously deployed pipeline
-python my_flow.py mage trigger --mage-host http://localhost:6789
-
-# Remove a pipeline from Mage
-python my_flow.py mage delete --mage-host http://localhost:6789
+python flow.py mage run \
+  --mage-host http://localhost:6789 \
+  --mage-project metaflow_project
+# Compiling HelloFlow to Mage pipeline...
+# Pipeline hello_flow deployed successfully.
+# Triggering pipeline run...
+# Pipeline run started: http://localhost:6789/pipelines/hello_flow/runs/1
+# Pipeline run is running...
+# Pipeline run 1 completed successfully.
 ```
 
-## Configuration reference
+**Deploy once, trigger many times with parameters:**
 
-All options can be set via CLI flags or environment variables.
+```bash
+python flow.py mage create --mage-host http://localhost:6789
+python flow.py mage trigger --mage-host http://localhost:6789 \
+  --run-param message=hello --run-param n=10
+```
 
-| Option | Env var | Default | Description |
-|---|---|---|---|
-| `--mage-host` | `MAGE_HOST` | `http://localhost:6789` | Mage server base URL |
-| `--mage-project` | `MAGE_PROJECT` | `metaflow_project` | Mage project name |
-| `--max-workers` | | `10` | Max concurrent block runs |
-| `--tag` | | | Tag the Metaflow run (repeatable) |
-| `--namespace` | | | Metaflow namespace |
-| `--with` | | | Apply step decorators (e.g. `--with retry`) |
-| `--branch` | | | `@project` branch name |
-| `--production` | | | Deploy as production branch |
-
-## Deployer API
-
-`metaflow-mage` implements the standard [Metaflow Deployer API](https://docs.metaflow.org/production/scheduling-metaflow-flows/introduction), so you can manage deployments programmatically:
+**Programmatic API:**
 
 ```python
 from metaflow import Deployer
 
-with Deployer("my_flow.py").mage(mage_host="http://localhost:6789") as d:
-    deployed = d.create()
-    run = deployed.run(greeting="hello")
-    print(run.status)        # RUNNING / SUCCEEDED / FAILED
-    print(run.mage_ui)       # link to the Mage pipeline run UI
-    print(run.run)           # metaflow.Run object with full artifact access
+with Deployer("flow.py") as d:
+    df = d.mage().create(
+        mage_host="http://localhost:6789",
+        mage_project="metaflow_project",
+    )
+    run = df.trigger(message="hello")
+    print(run.status)       # RUNNING / SUCCEEDED / FAILED
+    print(run.mage_ui)      # http://localhost:6789/pipelines/hello_flow/runs/1
+    print(run.run.successful)  # True
 ```
 
-Recovering an existing deployment:
+**Delete a deployed pipeline:**
 
-```python
-from metaflow.plugins.mage import MageDeployedFlow
-
-deployed = MageDeployedFlow.from_deployment("MyFlow")
-run = deployed.run()
+```bash
+python flow.py mage delete --mage-host http://localhost:6789
+# Pipeline hello_flow deleted from Mage.
 ```
 
-## Supported capabilities
+## How it works
 
-| Feature | Supported |
-|---|---|
-| Linear flows | Yes |
-| Static branching (split/join) | Yes |
-| foreach fan-out (single level) | Yes |
-| Nested foreach | Yes |
-| `@retry` | Yes |
-| `@timeout` | Yes |
-| `@catch` | Yes |
-| `@resources` | Yes |
-| `@project` (branch/production) | Yes |
-| `@config` / `config_expr` | Yes |
-| `Parameter` | Yes |
-| `@schedule` | Via Mage pipeline schedule (API trigger created automatically) |
-| `@parallel` (MPI-style) | Not supported (see below) |
+Each Metaflow step becomes a Mage Python block. An `init` block runs first to allocate the Metaflow run ID; subsequent blocks call `python flow.py step <step_name>` with `--run-id`, `--task-id`, and `--retry-count` threaded through as block outputs. Foreach steps emit a `foreach_init` block that enumerates items and fans out to per-item body blocks. A Mage API trigger (pipeline schedule) is created or reused on every `create`, so `trigger` works immediately without manual Mage UI setup.
 
-## Known limitations
+Supported graph patterns: linear, branch/join, foreach. `@parallel` is not supported.
 
-### `@parallel` is not supported
+## Configuration
 
-`@parallel` in Metaflow implements MPI-style collective communication: N workers all run the
-same step simultaneously and can exchange data through `current.parallel.*` (rank, num_workers,
-barrier). This requires all N workers to share a communication channel during step execution.
+| CLI option | Environment variable | Default | Description |
+|---|---|---|---|
+| `--mage-host` | `MAGE_HOST` | `http://localhost:6789` | Mage server base URL |
+| `--mage-project` | `MAGE_PROJECT` | `metaflow_project` | Mage project name |
+| `--max-workers` | — | `10` | Max concurrent block runs |
+| `--branch` | — | — | `@project` branch name |
+| `--production` | — | `false` | Deploy to the production project branch |
+| `--name` | — | derived from class name | Override the Mage pipeline UUID |
 
-Mage blocks are independent processes. There is no mechanism for blocks executing in the same
-pipeline run to communicate during execution. The collective semantics cannot be reproduced.
-This is a fundamental architectural mismatch, not a missing implementation.
+## Development
 
-If you need MPI-style parallelism, consider [metaflow-kestra](https://github.com/npow/metaflow-kestra)
-(which also does not support `@parallel`) or a Metaflow-native scheduler such as
-[AWS Batch](https://docs.metaflow.org/scaling/remote-tasks/aws-batch) or
-[Kubernetes](https://docs.metaflow.org/scaling/remote-tasks/kubernetes) with `@parallel`.
+```bash
+git clone https://github.com/npow/metaflow-mage
+cd metaflow-mage
+pip install -e ".[dev]"
+pytest tests/
+```
 
-## GHA setup
+Integration tests require a running Mage instance:
 
-The CI workflow (`.github/workflows/ux-tests.yml`) starts a fresh Mage Docker container for
-each deployer test, installs the extension inside the container, and runs the Metaflow UX test
-suite against it. No secrets are required for the UX tests. A `CODECOV_TOKEN` secret enables
-coverage upload.
-
-See [.github/workflows/ux-tests.yml](.github/workflows/ux-tests.yml) for the full setup.
+```bash
+docker run -it -p 6789:6789 mageai/mageai mage start metaflow_project
+pytest tests/ -m integration
+```
 
 ## License
 
