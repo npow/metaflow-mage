@@ -236,6 +236,33 @@ class MageCompiler:
 
         return env
 
+    def _build_step_env_vars(self, step_node) -> Dict[str, str]:
+        """Build env vars for a specific step, including @environment decorator vars.
+
+        The @environment decorator sets env vars via runtime_step_cli(), which is
+        called by Metaflow's local runtime. Since Mage calls step subprocesses
+        directly (not through the runtime), we must extract and evaluate @environment
+        vars at compile time and inject them into the step's block environment.
+
+        config_expr values are evaluated via str() which uses the current config
+        context (populated at compile time via METAFLOW_CLICK_API_PROCESS_CONFIG=1).
+        """
+        env = {}
+        # Find @environment decorator for this step
+        step_obj = next(
+            (s for s in self.flow if s.name == step_node.name), None
+        )
+        if step_obj is not None:
+            for deco in step_obj.decorators:
+                if deco.name == "environment":
+                    for key, value in deco.attributes.get("vars", {}).items():
+                        try:
+                            # str() evaluates config_expr objects and descriptor values
+                            env[key] = str(value)
+                        except Exception:
+                            pass
+        return env
+
     def _build_step_cmd_parts(
         self,
         step_name: str,
@@ -746,7 +773,20 @@ def run_{step_name}(*args, **kwargs):
                     for p in node.in_funcs
                 ]
 
-            content = self._render_step_block_content(step_name, node, env_lines)
+            # Merge global env vars with step-specific @environment decorator vars.
+            # @environment sets env vars via runtime_step_cli() which Mage doesn't call,
+            # so we evaluate them at compile time and inject directly into the block env.
+            step_specific_env = self._build_step_env_vars(node)
+            if step_specific_env:
+                merged_env = dict(env_vars)
+                merged_env.update(step_specific_env)
+                step_env_lines = "\n".join(
+                    "    env[%r] = %r" % (k, v) for k, v in sorted(merged_env.items())
+                )
+            else:
+                step_env_lines = env_lines
+
+            content = self._render_step_block_content(step_name, node, step_env_lines)
 
             blocks.append({
                 "name": block_name,
