@@ -100,12 +100,35 @@ class MageCompiler:
 
     @staticmethod
     def _extract_flow_config_value(flow) -> Optional[str]:
-        """Serialize compile-time config values to a JSON string."""
+        """Serialize compile-time config values to a JSON string.
+
+        Config values may be OmegaConf DictConfig objects (not JSON-serializable
+        by default). We convert them to plain dicts with OmegaConf.to_container()
+        before serializing. Without this, json.dumps raises TypeError which is
+        silently caught, causing METAFLOW_FLOW_CONFIG_VALUE to never be set
+        and @environment(vars={...: config_expr(...)}) to evaluate to None.
+        """
         try:
             from metaflow.flowspec import FlowStateItems
             flow_configs = flow._flow_state[FlowStateItems.CONFIGS]
+
+            def _to_serializable(value):
+                """Convert OmegaConf or other non-JSON types to plain Python."""
+                try:
+                    from omegaconf import OmegaConf
+                    if OmegaConf.is_config(value):
+                        return OmegaConf.to_container(value, resolve=True)
+                except ImportError:
+                    pass
+                # Try direct serialization; if it fails, convert via repr
+                try:
+                    json.dumps(value)
+                    return value
+                except (TypeError, ValueError):
+                    return str(value)
+
             config_env = {
-                name: value
+                name: _to_serializable(value)
                 for name, (value, _is_plain) in flow_configs.items()
                 if value is not None
             }
