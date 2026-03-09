@@ -107,23 +107,17 @@ def create(
     _validate_workflow(obj.flow, obj.graph)
 
     obj.echo("Compiling *%s* to Mage pipeline..." % obj.mage_pipeline_name, bold=True)
-    import sys as _sys
-    print("TRACE create: calling _build_compiler", file=_sys.stderr, flush=True)
+
     compiler = _build_compiler(
         obj, mage_host, mage_project, max_workers, with_decorators,
         branch, production, namespace=namespace, tags=tags,
     )
-    print("TRACE create: _build_compiler done", file=_sys.stderr, flush=True)
     blocks = compiler.compile()
-    print("TRACE create: compile() done, pipeline_uuid=%s blocks=%d" % (compiler.pipeline_uuid, len(blocks)), file=_sys.stderr, flush=True)
     pipeline_uuid = compiler.pipeline_uuid
 
     client = _make_client(mage_host)
-    print("TRACE create: calling _deploy_pipeline", file=_sys.stderr, flush=True)
     _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj)
-    print("TRACE create: _deploy_pipeline done, calling _ensure_api_trigger", file=_sys.stderr, flush=True)
     schedule_id, schedule_token = _ensure_api_trigger(client, mage_host, pipeline_uuid, obj)
-    print("TRACE create: _ensure_api_trigger done", file=_sys.stderr, flush=True)
 
     obj.echo(
         "Pipeline *%s* deployed to Mage at %s" % (pipeline_uuid, mage_host),
