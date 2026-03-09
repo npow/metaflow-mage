@@ -539,7 +539,7 @@ def run_{step_name}(*args, **kwargs):
     # Fall back to kwargs['context']['retry_count'] for compatibility with older Mage versions.
     if kwargs:
         _retry_meta = kwargs.get("retry") or {{}}
-        retry_count = int(_retry_meta.get("attempts", 0)) if isinstance(_retry_meta, dict) else 0
+        retry_count = max(0, int(_retry_meta.get("attempts", 0)) - 1) if isinstance(_retry_meta, dict) else 0
         if retry_count == 0:
             retry_count = int((kwargs.get("context") or {{}}).get("retry_count", 0))
     else:
@@ -618,13 +618,14 @@ def run_{step_name}(*args, **kwargs):
                 'import json, gzip, pickle, os, sys\n'
                 '_r = sys.argv[1]; _f = sys.argv[2]; _t = sys.argv[3]\n'
                 '_hint = sys.argv[4] if len(sys.argv) > 4 else ""\n'
-                '# Check multiple candidate sysroot dirs (container HOME may differ from env)\n'
+                '_rc = sys.argv[5] if len(sys.argv) > 5 else "0"\n'
                 'import os as _os\n'
+                '_dname = _rc + ".data.json"\n'
                 '_candidates = [_hint, "/home/runner", "/root", _os.environ.get("HOME",""), "/tmp"]\n'
                 '_p = None\n'
                 'for _cand in _candidates:\n'
                 '    if not _cand: continue\n'
-                '    _try = _os.path.join(_cand, ".metaflow", _f, _r, "start", _t, "0.data.json")\n'
+                '    _try = _os.path.join(_cand, ".metaflow", _f, _r, "start", _t, _dname)\n'
                 '    if _os.path.isfile(_try):\n'
                 '        _p = _try; _mf_root = _os.path.join(_cand, ".metaflow"); break\n'
                 'if not _p: sys.exit(0)\n'
@@ -636,7 +637,7 @@ def run_{step_name}(*args, **kwargs):
                 'try: print(int(pickle.loads(gzip.decompress(_blob))))\n'
                 'except: print(int(pickle.loads(_blob)))\n'
                 '""",\n'
-                '                run_id, %s, task_id, _sysroot],\n'
+                '                run_id, %s, task_id, _sysroot, str(retry_count)],\n'
                 '            env=env, capture_output=True, text=True\n'
                 '        )\n'
                 '        _out = _fc_result.stdout.strip()\n'
@@ -679,7 +680,7 @@ def run_{step_name}(*args, **kwargs):
     # Fall back to kwargs['context']['retry_count'] for compatibility with older Mage versions.
     if kwargs:
         _retry_meta = kwargs.get("retry") or {{}}
-        retry_count = int(_retry_meta.get("attempts", 0)) if isinstance(_retry_meta, dict) else 0
+        retry_count = max(0, int(_retry_meta.get("attempts", 0)) - 1) if isinstance(_retry_meta, dict) else 0
         if retry_count == 0:
             retry_count = int((kwargs.get("context") or {{}}).get("retry_count", 0))
     else:
@@ -708,13 +709,6 @@ def run_{step_name}(*args, **kwargs):
     print("Step {step_name} completed successfully")
     if result.stdout:
         print("STDOUT:", result.stdout[-2000:])
-    # DEBUG: show full cmd and env key vars
-    if {step_name!r} == "start":
-        print("DBG FULL CMD:", " ".join(str(c) for c in cmd))
-        print("DBG SYSROOT:", env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL"))
-        print("DBG DATASTORE:", env.get("METAFLOW_DEFAULT_DATASTORE"))
-        print("DBG STDOUT:", result.stdout[:200] if result.stdout else "(empty)")
-        print("DBG STDERR:", result.stderr[:200] if result.stderr else "(empty)")
 {foreach_count_code}
     return {{"run_id": run_id, "step": {step_name!r}, "status": "success"{foreach_return_field}}}
 '''.format(
