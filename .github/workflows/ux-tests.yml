@@ -1,124 +1,151 @@
-name: UX Tests - Mage
-
-# Compliance and integration tests for the Mage orchestrator.
-# Runs the full Metaflow UX test suite against a live Mage instance.
+name: UX Tests
 
 on:
   push:
     branches:
-      - master
+      - main
       - "**mage**"
   pull_request:
     branches:
-      - master
+      - main
+  schedule:
+    - cron: "0 6 * * *"  # nightly — catches upstream metaflow regressions
   workflow_dispatch:
 
-jobs:
-  ux-tests:
-    name: "Mage UX tests"
-    runs-on: ubuntu-latest
+env:
+  METAFLOW_DEFAULT_METADATA: local
+  METAFLOW_DEFAULT_DATASTORE: local
+  METAFLOW_DEFAULT_ENVIRONMENT: local
 
+jobs:
+  # Runner tests execute flows locally — no Mage scheduler needed.
+  runner-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Pin Metaflow local datastore root
+        run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
+
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+        with:
+          metaflow-ref: npow/corral-devstack
+          extra-install: "."
+          use-sudo: "false"
+          conda: "false"
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          pytest-args: "-n 4 -v --tb=short --timeout=180 -k 'runner' --cov-fail-under=0"
+          ux-test-config: |
+            backends:
+              - name: mage
+                scheduler_type: mage
+                cluster: null
+                decospec: null
+                deploy_args:
+                  mage_host: http://localhost:6789
+                  mage_project: metaflow_project
+                enabled: true
+
+  # Each deployer test gets its own worker with a fresh Mage container.
+  # This eliminates serialization and lets all tests run in parallel.
+  deployer-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Runner (local) backend -- always included
-          - backend: local
-            workers: 4
-
-          # Mage backend -- requires Mage Docker container
-          - backend: mage
-            workers: 2
+        test:
+          - test_hello_world
+          - test_hello_project
+          - test_from_deployment
+          - test_retry
+          - test_resources
+          - test_catch
+          - test_timeout
+          - test_config_simple_default
+          - test_config_simple_config_value
+          - test_config_simple_config
+          - test_mutable_flow_default
+          - test_mutable_flow_config_value
+          - test_config_corner_cases
+          - test_branch
+          - test_foreach
+          - test_nested_foreach
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Checkout metaflow
-        uses: actions/checkout@v4
-        with:
-          repository: Netflix/metaflow
-          path: metaflow-src
-
-      - name: Install Metaflow (dev) and dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -e metaflow-src
-          pip install -e ".[dev]" pytest-xdist pytest-timeout pytest-cov
+      - name: Pin Metaflow local datastore root
+        # Must match the path mounted into the Mage container below so both
+        # the test runner and Mage can read/write the same .metaflow artifacts.
+        run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
 
       - name: Start Mage via Docker
-        if: matrix.backend == 'mage'
         run: |
-          # Mount the metaflow repo so Mage containers can access flow files
-          mkdir -p /tmp/mage-project
-          docker run -d --name mage-test \
+          # Mount HOME so Mage can read/write .metaflow at the same path as the runner.
+          # Mount the workspace so Mage can execute flow files by their absolute path.
+          docker run -d --name mage \
             -p 6789:6789 \
-            -v /tmp/mage-project:/home/src \
-            -v ${{ github.workspace }}/metaflow-src:/metaflow-src \
-            -e PYTHONPATH=/metaflow-src \
+            -v "$HOME:$HOME" \
+            -v "${{ github.workspace }}:${{ github.workspace }}" \
+            -e REQUIRE_USER_AUTHENTICATION=0 \
+            -e METAFLOW_DATASTORE_SYSROOT_LOCAL="$HOME" \
             mageai/mageai:latest \
             mage start metaflow_project
-          # Wait for Mage to be ready
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:6789/api/status > /dev/null 2>&1 && break
-            sleep 3
-          done
-          curl -sf http://localhost:6789/api/status | python3 -m json.tool | head -10
 
-      - name: Create UX test config
+      - name: Wait for Mage to be healthy
         run: |
-          mkdir -p metaflow-src/test/ux
-          cat > metaflow-src/test/ux/ux_test_config.yaml << 'EOF'
-          backends:
-            - name: ${{ matrix.backend }}
-              scheduler_type: ${{ matrix.backend == 'mage' && 'mage' || null }}
-              cluster: null
-              decospec: null
-              deploy_args:
-                mage_host: "http://localhost:6789"
-                mage_project: "metaflow_project"
-              enabled: true
-          EOF
+          timeout 120 bash -c '
+            until curl -sf http://localhost:6789/api/status > /dev/null 2>&1; do
+              echo "  waiting for Mage..."
+              sleep 5
+            done
+          ' || { docker logs mage; exit 1; }
+          echo "Mage is ready."
 
-      - name: Run UX tests - ${{ matrix.backend }}
-        working-directory: metaflow-src
+      - name: Install metaflow and metaflow-mage inside Mage container
         run: |
-          METAFLOW_DEFAULT_METADATA=local \
-          METAFLOW_DEFAULT_DATASTORE=local \
-          METAFLOW_DATASTORE_SYSROOT_LOCAL=/tmp/mf-mage-test \
-          METAFLOW_PROFILE="" \
-          AWS_SHARED_CREDENTIALS_FILE="" \
-          PYTHONPATH=$PWD \
-          python -m pytest \
-            test/ux/core/test_basic.py \
-            test/ux/core/test_config.py \
-            --only-backend ${{ matrix.backend }} \
-            -m "not conda" \
-            -n ${{ matrix.workers }} \
-            -v \
-            --tb=short \
-            --timeout=600 \
-            --cov=metaflow \
-            --cov-report=xml:coverage.xml \
-            --junit-xml=junit-${{ matrix.backend }}.xml
+          CONTAINER=$(docker ps -q --filter name=mage)
+          # Install metaflow (matching the branch under test) and the extension.
+          # The extension is available inside the container via the workspace mount.
+          docker exec "$CONTAINER" pip install --quiet \
+            "git+https://github.com/Netflix/metaflow.git@npow/corral-devstack"
+          docker exec "$CONTAINER" pip install --quiet -e "${{ github.workspace }}"
 
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
         with:
-          name: coverage-${{ matrix.backend }}
-          path: metaflow-src/coverage.xml
-          if-no-files-found: ignore
-          include-hidden-files: true
+          metaflow-ref: npow/corral-devstack
+          extra-install: "."
+          use-sudo: "false"
+          conda: "false"
+          coverage-artifact-suffix: "${{ matrix.test }}"
+          pytest-args: "-v --tb=short --timeout=300 -k '${{ matrix.test }} and deployer' --cov-fail-under=0"
+          ux-test-config: |
+            backends:
+              - name: mage
+                scheduler_type: mage
+                cluster: null
+                decospec: null
+                deploy_args:
+                  mage_host: http://localhost:6789
+                  mage_project: metaflow_project
+                enabled: true
 
-      - name: Upload test results
+      - name: Dump Mage logs
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit-${{ matrix.backend }}
-          path: metaflow-src/junit-${{ matrix.backend }}.xml
-          if-no-files-found: ignore
+        run: docker logs --tail=200 mage
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f mage || true
