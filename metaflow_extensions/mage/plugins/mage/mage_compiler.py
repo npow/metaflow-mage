@@ -611,6 +611,8 @@ def run_{step_name}(*args, **kwargs):
                 '        _data_json = _os.path.join(\n'
                 '            _mf_root, %s, run_id, %s, task_id, "0.data.json"\n'
                 '        )\n'
+                '        print("DEBUG foreach: checking", _data_json, "exists:", _os.path.isfile(_data_json))\n'
+                '        import subprocess as _sp; _sp.run(["find", _mf_root, "-name", "0.data.json", "-maxdepth", "6"], capture_output=True, text=True).stdout and print("DEBUG found:", _sp.run(["find", _mf_root, "-name", "0.data.json", "-maxdepth", "6"], capture_output=True, text=True).stdout[:500])\n'
                 '        if _os.path.isfile(_data_json):\n'
                 '            with open(_data_json) as _f:\n'
                 '                _objects = _json.load(_f).get("objects", {})\n'
