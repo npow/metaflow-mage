@@ -611,8 +611,6 @@ def run_{step_name}(*args, **kwargs):
                 '        _data_json = _os.path.join(\n'
                 '            _mf_root, %s, run_id, %s, task_id, "0.data.json"\n'
                 '        )\n'
-                '        print("DEBUG foreach: checking", _data_json, "exists:", _os.path.isfile(_data_json))\n'
-                '        import subprocess as _sp; _sp.run(["find", _mf_root, "-name", "0.data.json", "-maxdepth", "6"], capture_output=True, text=True).stdout and print("DEBUG found:", _sp.run(["find", _mf_root, "-name", "0.data.json", "-maxdepth", "6"], capture_output=True, text=True).stdout[:500])\n'
                 '        if _os.path.isfile(_data_json):\n'
                 '            with open(_data_json) as _f:\n'
                 '                _objects = _json.load(_f).get("objects", {})\n'
@@ -631,14 +629,13 @@ def run_{step_name}(*args, **kwargs):
                 '    except Exception as _e:\n'
                 '        print("Warning: could not read _foreach_num_splits: %%s" %% _e)\n'
             ) % (
-                # Metaflow local storage uses current.flow_name for the directory.
-                # With METAFLOW_FLOW_CONFIG_VALUE set, @project computes the full
-                # scoped name (e.g. "foreach_flow.user.runner.ForeachFlow") which IS
-                # the storage key. self._flow_name captures this correctly at compile time.
-                # For flows without @project, self._flow_name == self.name (bare class).
-                repr(self._flow_name),
+                # Metaflow local storage always uses the bare Python class name
+                # (self.name = flow.__class__.__name__), NOT the project-scoped name.
+                # @project sets current.flow_name but does NOT change the storage path.
+                # Debug confirmed: find shows files at ForeachFlow/... not foreach_flow.user.runner.ForeachFlow/...
+                repr(self.name),
                 repr(step_name),
-                repr(self._flow_name),
+                repr(self.name),
                 step_name,
             )
             foreach_return_field = ', "foreach_count": foreach_count'
