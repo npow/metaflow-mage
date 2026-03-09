@@ -629,12 +629,14 @@ def run_{step_name}(*args, **kwargs):
                 '    except Exception as _e:\n'
                 '        print("Warning: could not read _foreach_num_splits: %%s" %% _e)\n'
             ) % (
-                # Metaflow local datastore always uses the bare Python class name
-                # (self.name), NOT the project-scoped name (self._flow_name).
-                # @project changes current.flow_name but NOT the storage key.
-                repr(self.name),
+                # Metaflow local storage uses current.flow_name for the directory.
+                # With METAFLOW_FLOW_CONFIG_VALUE set, @project computes the full
+                # scoped name (e.g. "foreach_flow.user.runner.ForeachFlow") which IS
+                # the storage key. self._flow_name captures this correctly at compile time.
+                # For flows without @project, self._flow_name == self.name (bare class).
+                repr(self._flow_name),
                 repr(step_name),
-                repr(self.name),
+                repr(self._flow_name),
                 step_name,
             )
             foreach_return_field = ', "foreach_count": foreach_count'
