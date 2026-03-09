@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 # Without it, @config/@project decorators use empty/default config at task runtime.
 
 # REQUIRED (Cap.PROJECT_BRANCH): "--branch" is forwarded to every step command
-# by MageCompiler._build_step_cmd_parts(). @project reads branch_name from
+# by MageCompiler._build_cmd_lists(). @project reads branch_name from
 # "--branch" at step runtime, not just at compile time.
 
 # REQUIRED (Cap.RETRY): retry_count is derived from the Mage block attempt context
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 # MageCompiler._build_env_vars() and baked into every step block environment.
 
 # REQUIRED: "--environment" flag is passed to step commands via
-# MageCompiler._build_step_cmd_parts(). Required for @conda flows to use
+# MageCompiler._build_cmd_lists(). Required for @conda flows to use
 # the correct Python interpreter.
 
 
