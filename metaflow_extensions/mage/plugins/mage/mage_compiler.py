@@ -599,37 +599,48 @@ def run_{step_name}(*args, **kwargs):
             # Read _foreach_num_splits via a fresh subprocess to avoid any
             # LocalStorage.datastore_root caching in the current Mage Python process.
             # The subprocess uses the same env as the step subprocess, so paths match.
+            # Read _foreach_num_splits via fresh subprocess.
+            # Use 'find' to locate the file regardless of where sysroot is,
+            # because the Mage container (HOME=/root) may write to /root/.metaflow
+            # even when env["METAFLOW_DATASTORE_SYSROOT_LOCAL"]=/home/runner.
+            # Read _foreach_num_splits via Metaflow Task API in a fresh subprocess.
+            # The fresh subprocess avoids LocalStorage.datastore_root caching in the
+            # Mage server process. Checks multiple candidate sysroot dirs to handle
+            # cases where the container's HOME (/root) differs from env sysroot.
             foreach_count_code = (
                 '\n'
                 '    # Cap.FOREACH_COUNT: read _foreach_num_splits via fresh subprocess\n'
                 '    foreach_count = 1\n'
                 '    try:\n'
+                '        _sysroot = env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")\n'
                 '        _fc_result = subprocess.run(\n'
                 '            [sys.executable, "-c", r"""\n'
                 'import json, gzip, pickle, os, sys\n'
-                '_s = sys.argv[1]; _r = sys.argv[2]; _f = sys.argv[3]; _t = sys.argv[4]\n'
-                '_p = os.path.join(_s, ".metaflow", _f, _r, "start", _t, "0.data.json")\n'
-                'if not os.path.isfile(_p):\n'
-                '    import subprocess as _sp\n'
-                '    _found = _sp.run(["find", os.path.join(_s, ".metaflow"), "-name", "0.data.json", "-maxdepth", "7"], capture_output=True, text=True).stdout.strip()\n'
-                '    print("FIND:", _found[:500])\n'
-                '    sys.exit(0)\n'
+                '_r = sys.argv[1]; _f = sys.argv[2]; _t = sys.argv[3]\n'
+                '_hint = sys.argv[4] if len(sys.argv) > 4 else ""\n'
+                '# Check multiple candidate sysroot dirs (container HOME may differ from env)\n'
+                'import os as _os\n'
+                '_candidates = [_hint, "/home/runner", "/root", _os.environ.get("HOME",""), "/tmp"]\n'
+                '_p = None\n'
+                'for _cand in _candidates:\n'
+                '    if not _cand: continue\n'
+                '    _try = _os.path.join(_cand, ".metaflow", _f, _r, "start", _t, "0.data.json")\n'
+                '    if _os.path.isfile(_try):\n'
+                '        _p = _try; _mf_root = _os.path.join(_cand, ".metaflow"); break\n'
+                'if not _p: sys.exit(0)\n'
                 '_obj = json.load(open(_p)).get("objects", {})\n'
                 '_key = _obj.get("_foreach_num_splits")\n'
                 'if not _key: sys.exit(0)\n'
-                '_bp = os.path.join(_s, ".metaflow", _f, "data", _key[:2], _key)\n'
+                '_bp = _os.path.join(_mf_root, _f, "data", _key[:2], _key)\n'
                 '_blob = open(_bp, "rb").read()\n'
                 'try: print(int(pickle.loads(gzip.decompress(_blob))))\n'
                 'except: print(int(pickle.loads(_blob)))\n'
                 '""",\n'
-                '                env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", ""),\n'
-                '                run_id, %s, task_id],\n'
+                '                run_id, %s, task_id, _sysroot],\n'
                 '            env=env, capture_output=True, text=True\n'
                 '        )\n'
                 '        _out = _fc_result.stdout.strip()\n'
-                '        if _out.startswith("FIND:"):\n'
-                '            print("DBG foreach find:", _out)\n'
-                '        elif _out.isdigit():\n'
+                '        if _out.isdigit():\n'
                 '            foreach_count = int(_out)\n'
                 '            print("Foreach step %s:", foreach_count, "items")\n'
                 '    except Exception as _e:\n'
