@@ -130,7 +130,9 @@ jobs:
         with:
           metaflow-ref: npow/corral-devstack
           extra-install: "."
-          use-sudo: "false"
+          # Mage runs as root and creates root-owned .metaflow artifact files;
+          # sudo -E lets pytest read them without permission errors.
+          use-sudo: "true"
           conda: "false"
           coverage-artifact-suffix: "${{ matrix.test }}"
           pytest-args: "-v --tb=short --timeout=300 -k '${{ matrix.test }} and deployer' --cov-fail-under=0"
