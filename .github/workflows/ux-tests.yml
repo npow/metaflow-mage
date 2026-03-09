@@ -117,11 +117,14 @@ jobs:
       - name: Install metaflow and metaflow-mage inside Mage container
         run: |
           CONTAINER=$(docker ps -q --filter name=mage)
-          # Install metaflow (matching the branch under test) and the extension.
-          # The extension is available inside the container via the workspace mount.
+          # Install metaflow (matching the branch under test).
           docker exec "$CONTAINER" pip install --quiet \
             "git+https://github.com/Netflix/metaflow.git@npow/corral-devstack"
-          docker exec "$CONTAINER" pip install --quiet -e "${{ github.workspace }}"
+          # Copy the extension source into the container at a non-mounted path so
+          # root-owned build artifacts (egg-info) don't pollute the workspace and
+          # cause permission errors when the runner later runs `pip install -e .`.
+          docker cp "${{ github.workspace }}/." "$CONTAINER:/tmp/metaflow-mage-src/"
+          docker exec "$CONTAINER" pip install --quiet /tmp/metaflow-mage-src
 
       - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
         with:
