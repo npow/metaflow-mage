@@ -263,6 +263,20 @@ class MageCompiler:
                             pass
         return env
 
+    def _get_max_user_code_retries(self, step_node) -> int:
+        """Extract max retry count from step's @retry decorator.
+
+        Returns 0 if no @retry decorator is present.
+        """
+        step_obj = next(
+            (s for s in self.flow if s.name == step_node.name), None
+        )
+        if step_obj is not None:
+            for deco in step_obj.decorators:
+                if deco.name == "retry":
+                    return int(deco.attributes.get("times", 3))
+        return 0
+
     def _build_step_cmd_parts(
         self,
         step_name: str,
@@ -449,6 +463,256 @@ def metaflow_init(*args, **kwargs):
         )
         return "    input_paths = %s\n" % paths
 
+    def _build_foreach_count_reader_inline(self, step_name: str) -> str:
+        """Return code that reads _foreach_num_splits per foreach body task.
+
+        This is used when a foreach body step is ALSO a foreach step (nested foreach).
+        After all body iterations complete, reads each task's _foreach_num_splits
+        and builds a nested_foreach_counts list.
+        """
+        return (
+            '\n'
+            '    # Read _foreach_num_splits from each body task for nested foreach\n'
+            '    nested_foreach_counts = []\n'
+            '    for _nfc_i in range(foreach_count):\n'
+            '        _nfc_task_id = run_id + "-" + %r + "-" + str(_nfc_i)\n'
+            '        _nfc_count = 1\n'
+            '        try:\n'
+            '            _sysroot = env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")\n'
+            '            _nfc_result = subprocess.run(\n'
+            '                [sys.executable, "-c", r"""\n'
+            'import json, gzip, pickle, os, sys\n'
+            '_r = sys.argv[1]; _f = sys.argv[2]; _t = sys.argv[3]\n'
+            '_hint = sys.argv[4] if len(sys.argv) > 4 else ""\n'
+            '_step = sys.argv[5] if len(sys.argv) > 5 else "start"\n'
+            'import os as _os\n'
+            '_candidates = [_hint, "/home/runner", "/root", _os.environ.get("HOME",""), "/tmp"]\n'
+            '_p = None\n'
+            'for _cand in _candidates:\n'
+            '    if not _cand: continue\n'
+            '    _dir = _os.path.join(_cand, ".metaflow", _f, _r, _step, _t)\n'
+            '    if _os.path.isdir(_dir):\n'
+            '        _files = sorted([x for x in _os.listdir(_dir) if x.endswith(".data.json")], reverse=True)\n'
+            '        if _files:\n'
+            '            _p = _os.path.join(_dir, _files[0]); _mf_root = _os.path.join(_cand, ".metaflow"); break\n'
+            'if not _p: sys.exit(0)\n'
+            '_obj = json.load(open(_p)).get("objects", {})\n'
+            '_key = _obj.get("_foreach_num_splits")\n'
+            'if not _key: sys.exit(0)\n'
+            '_bp = _os.path.join(_mf_root, _f, "data", _key[:2], _key)\n'
+            '_blob = open(_bp, "rb").read()\n'
+            'try: print(int(pickle.loads(gzip.decompress(_blob))))\n'
+            'except: print(int(pickle.loads(_blob)))\n'
+            '""",\n'
+            '                    run_id, %s, _nfc_task_id, _sysroot, %r],\n'
+            '                env=env, capture_output=True, text=True\n'
+            '            )\n'
+            '            _nfc_out = _nfc_result.stdout.strip()\n'
+            '            if _nfc_out.isdigit():\n'
+            '                _nfc_count = int(_nfc_out)\n'
+            '        except Exception as _e:\n'
+            '            print("Warning: nested foreach_count error for task %%s: %%s" %% (_nfc_task_id, _e))\n'
+            '        nested_foreach_counts.append(_nfc_count)\n'
+            '        print("Nested foreach: %%s task %%d has %%d items" %% (%r, _nfc_i, _nfc_count))\n'
+        ) % (step_name, repr(self.name), step_name, step_name)
+
+    def _render_nested_foreach_body(
+        self,
+        step_name: str,
+        step_node,
+        parent_step: str,
+        env_lines: str,
+        top_cmd_list: str,
+        step_cmd_list: str,
+        max_retries: int,
+        is_also_foreach: bool,
+    ) -> str:
+        """Render a nested foreach body block (e.g., 'inner' step).
+
+        The parent step is itself a foreach body, creating tasks like
+        run_id-parent-0, run_id-parent-1, etc. This block must iterate
+        over all (outer_i, inner_j) combinations.
+        """
+        # If this nested body is also a foreach step, we need to read
+        # _foreach_num_splits from each task too.
+        nested_read_code = ""
+        nested_return_extra = ""
+        if is_also_foreach:
+            # 3-level nesting not supported yet; this handles 2-level correctly
+            nested_read_code = self._build_foreach_count_reader_inline(step_name)
+            nested_return_extra = ', "nested_foreach_counts": nested_foreach_counts'
+
+        return '''import os
+import subprocess
+import sys
+
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+
+
+@custom
+def run_{step_name}(*args, **kwargs):
+    """Execute nested foreach body step: {step_name}"""
+    # Get run_id, outer foreach_count, and per-outer inner counts from upstream
+    upstream_output = args[0] if args else {{}}
+    if isinstance(upstream_output, dict):
+        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")
+        foreach_count = int(upstream_output.get("foreach_count", 1))
+        nested_foreach_counts = upstream_output.get("nested_foreach_counts", [1] * foreach_count)
+    else:
+        run_id = str(upstream_output) if upstream_output else None
+        foreach_count = 1
+        nested_foreach_counts = [1]
+
+    if not run_id:
+        raise RuntimeError("No run_id found from upstream block output")
+
+    params_task_id = "mage-params"
+    max_retries = {max_retries}
+
+    env = os.environ.copy()
+{env_lines}
+    env["MF_RUN_ID"] = run_id
+
+    top_cmd = {top_cmd_list}
+
+    # Nested foreach: iterate over all (outer_i, inner_j) combinations
+    for outer_i in range(foreach_count):
+        inner_count = nested_foreach_counts[outer_i] if outer_i < len(nested_foreach_counts) else 1
+        parent_task_id = run_id + "-" + {parent_step_repr} + "-" + str(outer_i)
+        for inner_j in range(inner_count):
+            task_id = run_id + "-" + {step_name_repr} + "-" + str(outer_i) + "-" + str(inner_j)
+            input_paths = run_id + "/" + {parent_step_repr} + "/" + parent_task_id
+            for retry_count in range(max_retries + 1):
+                step_cmd = {step_cmd_list}
+                step_cmd += ["--split-index", str(inner_j)]
+                step_cmd += ["--input-paths", input_paths]
+                cmd = top_cmd + step_cmd
+
+                print("Running {step_name} outer=%d inner=%d retry=%d (task_id=%s)" % (outer_i, inner_j, retry_count, task_id))
+                result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+                if result.returncode == 0:
+                    break
+                if retry_count < max_retries:
+                    print("Step {step_name} outer=%d inner=%d failed on attempt %d, retrying..." % (outer_i, inner_j, retry_count))
+                    if result.stderr:
+                        print("STDERR:", result.stderr[-2000:])
+                    continue
+                print("STDOUT:", result.stdout[-4000:])
+                print("STDERR:", result.stderr[-4000:])
+                raise RuntimeError(
+                    "Metaflow step {step_name!r} outer=%d inner=%d failed (exit %d): %s"
+                    % (outer_i, inner_j, result.returncode, result.stderr[-500:])
+                )
+            if result.stdout:
+                print("STDOUT:", result.stdout[-2000:])
+{nested_read_code}
+    print("Step {step_name} completed all nested foreach items")
+    return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "nested_foreach_counts": nested_foreach_counts, "status": "success"{nested_return_extra}}}
+'''.format(
+            step_name=step_name,
+            step_name_repr=repr(step_name),
+            parent_step_repr=repr(parent_step),
+            max_retries=max_retries,
+            env_lines=env_lines,
+            top_cmd_list=top_cmd_list,
+            step_cmd_list=step_cmd_list,
+            nested_read_code=nested_read_code,
+            nested_return_extra=nested_return_extra,
+        )
+
+    def _render_nested_foreach_join(
+        self,
+        step_name: str,
+        step_node,
+        parent_step: str,
+        env_lines: str,
+        top_cmd_list: str,
+        step_cmd_list: str,
+        max_retries: int,
+    ) -> str:
+        """Render a join block inside a nested foreach (e.g., 'inner_join').
+
+        This join runs once per outer foreach iteration, gathering all inner
+        body tasks for that iteration.
+        """
+        return '''import os
+import subprocess
+import sys
+
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+
+
+@custom
+def run_{step_name}(*args, **kwargs):
+    """Execute nested foreach join step: {step_name}"""
+    upstream_output = args[0] if args else {{}}
+    if isinstance(upstream_output, dict):
+        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")
+        foreach_count = int(upstream_output.get("foreach_count", 1))
+        nested_foreach_counts = upstream_output.get("nested_foreach_counts", [1] * foreach_count)
+    else:
+        run_id = str(upstream_output) if upstream_output else None
+        foreach_count = 1
+        nested_foreach_counts = [1]
+
+    if not run_id:
+        raise RuntimeError("No run_id found from upstream block output")
+
+    params_task_id = "mage-params"
+    max_retries = {max_retries}
+
+    env = os.environ.copy()
+{env_lines}
+    env["MF_RUN_ID"] = run_id
+
+    top_cmd = {top_cmd_list}
+
+    # Nested foreach join: run join once per outer iteration
+    for outer_i in range(foreach_count):
+        inner_count = nested_foreach_counts[outer_i] if outer_i < len(nested_foreach_counts) else 1
+        task_id = run_id + "-" + {step_name_repr} + "-" + str(outer_i)
+        # Gather input_paths from all inner body tasks for this outer iteration
+        input_paths = ",".join(
+            run_id + "/" + {parent_step_repr} + "/" + run_id + "-" + {parent_step_repr} + "-" + str(outer_i) + "-" + str(j)
+            for j in range(inner_count)
+        )
+        for retry_count in range(max_retries + 1):
+            step_cmd = {step_cmd_list}
+            step_cmd += ["--input-paths", input_paths]
+            cmd = top_cmd + step_cmd
+
+            print("Running {step_name} outer=%d retry=%d (task_id=%s)" % (outer_i, retry_count, task_id))
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            if result.returncode == 0:
+                break
+            if retry_count < max_retries:
+                print("Step {step_name} outer=%d failed on attempt %d, retrying..." % (outer_i, retry_count))
+                if result.stderr:
+                    print("STDERR:", result.stderr[-2000:])
+                continue
+            print("STDOUT:", result.stdout[-4000:])
+            print("STDERR:", result.stderr[-4000:])
+            raise RuntimeError(
+                "Metaflow step {step_name!r} outer=%d failed (exit %d): %s"
+                % (outer_i, result.returncode, result.stderr[-500:])
+            )
+        if result.stdout:
+            print("STDOUT:", result.stdout[-2000:])
+
+    print("Step {step_name} completed all %d join iterations" % foreach_count)
+    return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"}}
+'''.format(
+            step_name=step_name,
+            step_name_repr=repr(step_name),
+            parent_step_repr=repr(parent_step),
+            max_retries=max_retries,
+            env_lines=env_lines,
+            top_cmd_list=top_cmd_list,
+            step_cmd_list=step_cmd_list,
+        )
+
     def _render_step_block_content(
         self,
         step_name: str,
@@ -507,9 +771,34 @@ def metaflow_init(*args, **kwargs):
             # The foreach step output contains foreach_count; we loop over all items,
             # running the step subprocess with --split-index <i> and a per-item task_id.
             # The join block expects task_ids of the form: run_id + '-' + step_name + '-' + str(i)
-            #
-            # input_paths_code uses 4-space indentation; inside the loop we need 8 spaces.
-            indented_input_paths_code = "    " + input_paths_code.rstrip("\n").replace("\n    ", "\n        ")
+
+            parent_step = list(step_node.in_funcs)[0] if step_node.in_funcs else ""
+            max_retries = self._get_max_user_code_retries(step_node)
+            is_also_foreach = (step_node.type == "foreach")
+
+            # Detect nested foreach: parent is itself a foreach body
+            split_parents = getattr(step_node, "split_parents", [])
+            is_nested_body = len(split_parents) > 1
+
+            # Determine how the parent task_id is formed.
+            # For non-nested: parent task_id is "mage-1" (the fixed id for regular steps).
+            # For nested: parent is a foreach body, so its task_ids are
+            #   run_id + "-" + parent_step + "-" + str(outer_i)
+            if is_nested_body:
+                return self._render_nested_foreach_body(
+                    step_name, step_node, parent_step, env_lines,
+                    top_cmd_list, step_cmd_list, max_retries, is_also_foreach,
+                )
+
+            # Build foreach_count reading code for steps that are ALSO foreach steps
+            # (e.g., "outer" in a nested foreach: it's a foreach body of "start" AND
+            # a foreach step that sets up its own foreach items).
+            foreach_read_code = ""
+            foreach_return_extra = ""
+            if is_also_foreach:
+                foreach_read_code = self._build_foreach_count_reader_inline(step_name)
+                foreach_return_extra = ', "nested_foreach_counts": nested_foreach_counts'
+
             return '''import os
 import subprocess
 import sys
@@ -534,16 +823,7 @@ def run_{step_name}(*args, **kwargs):
         raise RuntimeError("No run_id found from upstream block output")
 
     params_task_id = "mage-params"
-    # Cap.RETRY: derive retry_count from Mage block attempt number.
-    # Mage exposes retry info as kwargs['retry']['attempts'] (via BlockExecutor.retry_metadata).
-    # Fall back to kwargs['context']['retry_count'] for compatibility with older Mage versions.
-    if kwargs:
-        _retry_meta = kwargs.get("retry") or {{}}
-        retry_count = max(0, int(_retry_meta.get("attempts", 0)) - 1) if isinstance(_retry_meta, dict) else 0
-        if retry_count == 0:
-            retry_count = int((kwargs.get("context") or {{}}).get("retry_count", 0))
-    else:
-        retry_count = 0
+    max_retries = {max_retries}
 
     env = os.environ.copy()
 {env_lines}
@@ -557,14 +837,21 @@ def run_{step_name}(*args, **kwargs):
         task_id = run_id + "-" + {step_name_repr} + "-" + str(split_index)
         # input_paths: parent foreach step task (task_id for parent is "mage-1")
         input_paths = run_id + "/" + {parent_step_repr} + "/mage-1"
-        step_cmd = {step_cmd_list}
-        step_cmd += ["--split-index", str(split_index)]
-        step_cmd += ["--input-paths", input_paths]
-        cmd = top_cmd + step_cmd
+        for retry_count in range(max_retries + 1):
+            step_cmd = {step_cmd_list}
+            step_cmd += ["--split-index", str(split_index)]
+            step_cmd += ["--input-paths", input_paths]
+            cmd = top_cmd + step_cmd
 
-        print("Running {step_name} split_index=%d (task_id=%s)" % (split_index, task_id))
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-        if result.returncode != 0:
+            print("Running {step_name} split_index=%d retry=%d (task_id=%s)" % (split_index, retry_count, task_id))
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            if result.returncode == 0:
+                break
+            if retry_count < max_retries:
+                print("Step {step_name} split_index=%d failed on attempt %d, retrying..." % (split_index, retry_count))
+                if result.stderr:
+                    print("STDERR:", result.stderr[-2000:])
+                continue
             print("STDOUT:", result.stdout[-4000:])
             print("STDERR:", result.stderr[-4000:])
             raise RuntimeError(
@@ -573,16 +860,30 @@ def run_{step_name}(*args, **kwargs):
             )
         if result.stdout:
             print("STDOUT:", result.stdout[-2000:])
-
+{foreach_read_code}
     print("Step {step_name} completed all %d foreach items" % foreach_count)
-    return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"}}
+    return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"{foreach_return_extra}}}
 '''.format(
                 step_name=step_name,
                 step_name_repr=repr(step_name),
-                parent_step_repr=repr(list(step_node.in_funcs)[0] if step_node.in_funcs else ""),
+                parent_step_repr=repr(parent_step),
+                max_retries=max_retries,
                 env_lines=env_lines,
                 top_cmd_list=top_cmd_list,
                 step_cmd_list=step_cmd_list,
+                foreach_read_code=foreach_read_code,
+                foreach_return_extra=foreach_return_extra,
+            )
+
+        # Detect nested foreach join: a join step inside a nested foreach
+        # (e.g., inner_join with split_parents=['start', 'outer'])
+        split_parents = getattr(step_node, "split_parents", [])
+        if step_node.type == "join" and len(split_parents) > 1:
+            parent_step = list(step_node.in_funcs)[0] if step_node.in_funcs else ""
+            max_retries = self._get_max_user_code_retries(step_node)
+            return self._render_nested_foreach_join(
+                step_name, step_node, parent_step, env_lines,
+                top_cmd_list, step_cmd_list, max_retries,
             )
 
         # For foreach steps, we need to read _foreach_num_splits after execution
@@ -591,22 +892,7 @@ def run_{step_name}(*args, **kwargs):
         foreach_return_field = ""
         if is_foreach_step:
             # Read _foreach_num_splits directly from the local datastore files.
-            # The task datastore stores artifacts as content-addressed blobs:
-            #   <sysroot>/.metaflow/<flow>/<run_id>/<step>/<task_id>/0.data.json
-            #     -> maps "_foreach_num_splits" -> CA key
-            #   <sysroot>/.metaflow/<flow>/data/<key[:2]>/<key>
-            #     -> gzip+pickle blob of the actual value
-            # Read _foreach_num_splits via a fresh subprocess to avoid any
-            # LocalStorage.datastore_root caching in the current Mage Python process.
             # The subprocess uses the same env as the step subprocess, so paths match.
-            # Read _foreach_num_splits via fresh subprocess.
-            # Use 'find' to locate the file regardless of where sysroot is,
-            # because the Mage container (HOME=/root) may write to /root/.metaflow
-            # even when env["METAFLOW_DATASTORE_SYSROOT_LOCAL"]=/home/runner.
-            # Read _foreach_num_splits via Metaflow Task API in a fresh subprocess.
-            # The fresh subprocess avoids LocalStorage.datastore_root caching in the
-            # Mage server process. Checks multiple candidate sysroot dirs to handle
-            # cases where the container's HOME (/root) differs from env sysroot.
             foreach_count_code = (
                 '\n'
                 '    # Cap.FOREACH_COUNT: read _foreach_num_splits via fresh subprocess\n'
@@ -618,16 +904,17 @@ def run_{step_name}(*args, **kwargs):
                 'import json, gzip, pickle, os, sys\n'
                 '_r = sys.argv[1]; _f = sys.argv[2]; _t = sys.argv[3]\n'
                 '_hint = sys.argv[4] if len(sys.argv) > 4 else ""\n'
-                '_rc = sys.argv[5] if len(sys.argv) > 5 else "0"\n'
+                '_step = sys.argv[5] if len(sys.argv) > 5 else "start"\n'
                 'import os as _os\n'
-                '_dname = _rc + ".data.json"\n'
                 '_candidates = [_hint, "/home/runner", "/root", _os.environ.get("HOME",""), "/tmp"]\n'
                 '_p = None\n'
                 'for _cand in _candidates:\n'
                 '    if not _cand: continue\n'
-                '    _try = _os.path.join(_cand, ".metaflow", _f, _r, "start", _t, _dname)\n'
-                '    if _os.path.isfile(_try):\n'
-                '        _p = _try; _mf_root = _os.path.join(_cand, ".metaflow"); break\n'
+                '    _dir = _os.path.join(_cand, ".metaflow", _f, _r, _step, _t)\n'
+                '    if _os.path.isdir(_dir):\n'
+                '        _files = sorted([x for x in _os.listdir(_dir) if x.endswith(".data.json")], reverse=True)\n'
+                '        if _files:\n'
+                '            _p = _os.path.join(_dir, _files[0]); _mf_root = _os.path.join(_cand, ".metaflow"); break\n'
                 'if not _p: sys.exit(0)\n'
                 '_obj = json.load(open(_p)).get("objects", {})\n'
                 '_key = _obj.get("_foreach_num_splits")\n'
@@ -637,7 +924,7 @@ def run_{step_name}(*args, **kwargs):
                 'try: print(int(pickle.loads(gzip.decompress(_blob))))\n'
                 'except: print(int(pickle.loads(_blob)))\n'
                 '""",\n'
-                '                run_id, %s, task_id, _sysroot, str(retry_count)],\n'
+                '                run_id, %s, task_id, _sysroot, %r],\n'
                 '            env=env, capture_output=True, text=True\n'
                 '        )\n'
                 '        _out = _fc_result.stdout.strip()\n'
@@ -648,6 +935,7 @@ def run_{step_name}(*args, **kwargs):
                 '        print("Warning: foreach_count error:", _e)\n'
             ) % (
                 repr(self.name),
+                step_name,
                 step_name,
             )
             foreach_return_field = ', "foreach_count": foreach_count'
@@ -675,16 +963,10 @@ def run_{step_name}(*args, **kwargs):
 
     params_task_id = "mage-params"  # task_id used in metaflow init (non-integer so metadata registers it)
     task_id = "mage-1"  # non-integer task_id forces local metadata to create _self.json
-    # Cap.RETRY: derive retry_count from Mage block attempt number.
-    # Mage exposes retry info as kwargs['retry']['attempts'] (via BlockExecutor.retry_metadata).
-    # Fall back to kwargs['context']['retry_count'] for compatibility with older Mage versions.
-    if kwargs:
-        _retry_meta = kwargs.get("retry") or {{}}
-        retry_count = max(0, int(_retry_meta.get("attempts", 0)) - 1) if isinstance(_retry_meta, dict) else 0
-        if retry_count == 0:
-            retry_count = int((kwargs.get("context") or {{}}).get("retry_count", 0))
-    else:
-        retry_count = 0
+    # Cap.RETRY: in-block retry loop handles Metaflow @retry(times=N).
+    # Mage does not retry blocks by default, so we implement step-level retry
+    # within the generated block code, incrementing --retry-count each attempt.
+    max_retries = {max_retries}
 
     env = os.environ.copy()
 {env_lines}
@@ -693,13 +975,21 @@ def run_{step_name}(*args, **kwargs):
     # Compute input_paths for this step
 {input_paths_code}
     top_cmd = {top_cmd_list}
-    step_cmd = {step_cmd_list}
-    if input_paths:
-        step_cmd += ["--input-paths", input_paths]
-    cmd = top_cmd + step_cmd
 
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode != 0:
+    for retry_count in range(max_retries + 1):
+        step_cmd = {step_cmd_list}
+        if input_paths:
+            step_cmd += ["--input-paths", input_paths]
+        cmd = top_cmd + step_cmd
+
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if result.returncode == 0:
+            break
+        if retry_count < max_retries:
+            print("Step {step_name} failed on attempt %d, retrying (%d/%d)..." % (retry_count, retry_count + 1, max_retries))
+            if result.stderr:
+                print("STDERR:", result.stderr[-2000:])
+            continue
         print("STDOUT:", result.stdout[-4000:])
         print("STDERR:", result.stderr[-4000:])
         raise RuntimeError(
@@ -713,6 +1003,7 @@ def run_{step_name}(*args, **kwargs):
     return {{"run_id": run_id, "step": {step_name!r}, "status": "success"{foreach_return_field}}}
 '''.format(
             step_name=step_name,
+            max_retries=self._get_max_user_code_retries(step_node),
             env_lines=env_lines,
             input_paths_code=input_paths_code,
             top_cmd_list=top_cmd_list,
