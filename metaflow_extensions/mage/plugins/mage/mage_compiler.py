@@ -629,9 +629,12 @@ def run_{step_name}(*args, **kwargs):
                 '    except Exception as _e:\n'
                 '        print("Warning: could not read _foreach_num_splits: %%s" %% _e)\n'
             ) % (
-                repr(self._flow_name),
+                # Metaflow local datastore always uses the bare Python class name
+                # (self.name), NOT the project-scoped name (self._flow_name).
+                # @project changes current.flow_name but NOT the storage key.
+                repr(self.name),
                 repr(step_name),
-                repr(self._flow_name),
+                repr(self.name),
                 step_name,
             )
             foreach_return_field = ', "foreach_count": foreach_count'
