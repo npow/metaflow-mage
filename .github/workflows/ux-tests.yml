@@ -1,0 +1,124 @@
+name: UX Tests - Mage
+
+# Compliance and integration tests for the Mage orchestrator.
+# Runs the full Metaflow UX test suite against a live Mage instance.
+
+on:
+  push:
+    branches:
+      - master
+      - "**mage**"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  ux-tests:
+    name: "Mage UX tests"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Runner (local) backend -- always included
+          - backend: local
+            workers: 4
+
+          # Mage backend -- requires Mage Docker container
+          - backend: mage
+            workers: 2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Checkout metaflow
+        uses: actions/checkout@v4
+        with:
+          repository: Netflix/metaflow
+          path: metaflow-src
+
+      - name: Install Metaflow (dev) and dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e metaflow-src
+          pip install -e ".[dev]" pytest-xdist pytest-timeout pytest-cov
+
+      - name: Start Mage via Docker
+        if: matrix.backend == 'mage'
+        run: |
+          # Mount the metaflow repo so Mage containers can access flow files
+          mkdir -p /tmp/mage-project
+          docker run -d --name mage-test \
+            -p 6789:6789 \
+            -v /tmp/mage-project:/home/src \
+            -v ${{ github.workspace }}/metaflow-src:/metaflow-src \
+            -e PYTHONPATH=/metaflow-src \
+            mageai/mageai:latest \
+            mage start metaflow_project
+          # Wait for Mage to be ready
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:6789/api/status > /dev/null 2>&1 && break
+            sleep 3
+          done
+          curl -sf http://localhost:6789/api/status | python3 -m json.tool | head -10
+
+      - name: Create UX test config
+        run: |
+          mkdir -p metaflow-src/test/ux
+          cat > metaflow-src/test/ux/ux_test_config.yaml << 'EOF'
+          backends:
+            - name: ${{ matrix.backend }}
+              scheduler_type: ${{ matrix.backend == 'mage' && 'mage' || null }}
+              cluster: null
+              decospec: null
+              deploy_args:
+                mage_host: "http://localhost:6789"
+                mage_project: "metaflow_project"
+              enabled: true
+          EOF
+
+      - name: Run UX tests - ${{ matrix.backend }}
+        working-directory: metaflow-src
+        run: |
+          METAFLOW_DEFAULT_METADATA=local \
+          METAFLOW_DEFAULT_DATASTORE=local \
+          METAFLOW_DATASTORE_SYSROOT_LOCAL=/tmp/mf-mage-test \
+          METAFLOW_PROFILE="" \
+          AWS_SHARED_CREDENTIALS_FILE="" \
+          PYTHONPATH=$PWD \
+          python -m pytest \
+            test/ux/core/test_basic.py \
+            test/ux/core/test_config.py \
+            --only-backend ${{ matrix.backend }} \
+            -m "not conda" \
+            -n ${{ matrix.workers }} \
+            -v \
+            --tb=short \
+            --timeout=600 \
+            --cov=metaflow \
+            --cov-report=xml:coverage.xml \
+            --junit-xml=junit-${{ matrix.backend }}.xml
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.backend }}
+          path: metaflow-src/coverage.xml
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.backend }}
+          path: metaflow-src/junit-${{ matrix.backend }}.xml
+          if-no-files-found: ignore

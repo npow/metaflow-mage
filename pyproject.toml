@@ -1,0 +1,71 @@
+[project]
+name = "metaflow-mage"
+version = "0.1.0"
+description = "Run Metaflow flows as Mage pipelines"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Nissan Pow", email = "nissan.pow@gmail.com" }]
+keywords = ["metaflow", "mage", "mageai", "workflow", "orchestration", "mlops"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "metaflow>=2.9",
+    "click>=8.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-timeout>=2.0",
+    "requests>=2.28",
+    "ruff>=0.4",
+    "metaflow-orchestrator-kit",
+]
+
+[project.urls]
+Homepage = "https://github.com/npow/metaflow-mage"
+Repository = "https://github.com/npow/metaflow-mage"
+
+[tool.setuptools.packages.find]
+include = ["metaflow_extensions*"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "W", "B", "C4"]
+ignore = ["E501", "B008", "B904"]
+
+[tool.coverage.run]
+source = ["metaflow_extensions"]
+omit = ["tests/*", "*/mfextinit_*.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+    "integration: requires external Mage server (docker)",
+    "e2e: alias for integration tests requiring external Mage server",
+]
