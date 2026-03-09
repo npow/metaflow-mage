@@ -3,7 +3,7 @@
 [![CI](https://github.com/npow/metaflow-mage/actions/workflows/ux-tests.yml/badge.svg)](https://github.com/npow/metaflow-mage/actions/workflows/ux-tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/metaflow-mage)](https://pypi.org/project/metaflow-mage/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Python](https://img.shields.io/pypi/pyversions/metaflow-mage)](https://pypi.org/project/metaflow-mage/)
+[![Python](https://img.shields.io/pypi/pyversions/metaflow-mage)](https://pypi.org/project/metaflow-mage/) [![Docs](https://img.shields.io/badge/docs-mintlify-18a34a?style=flat-square)](https://mintlify.com/npow/metaflow-mage)
 
 Run any Metaflow flow as a Mage pipeline without rewriting your steps.
 
