@@ -511,7 +511,7 @@ def run_{step_name}(*args, **kwargs):
     # Mage exposes retry info as kwargs['retry']['attempts'] (via BlockExecutor.retry_metadata).
     # Fall back to kwargs['context']['retry_count'] for compatibility with older Mage versions.
     if kwargs:
-        _retry_meta = kwargs.get("retry") or {}
+        _retry_meta = kwargs.get("retry") or {{}}
         retry_count = int(_retry_meta.get("attempts", 0)) if isinstance(_retry_meta, dict) else 0
         if retry_count == 0:
             retry_count = int((kwargs.get("context") or {{}}).get("retry_count", 0))
