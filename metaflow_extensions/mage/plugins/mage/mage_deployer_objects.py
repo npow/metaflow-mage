@@ -309,14 +309,16 @@ class MageDeployedFlow(DeployedFlow):
         # mage-{md5(str(pipeline_run_id))[:16]}
         run_id = "mage-" + hashlib.md5(str(pipeline_run_id).encode()).hexdigest()[:16]
 
-        flow_class_name = (
-            additional_info.get("mf_flow_class")
-            or (
-                self.deployer.flow_name
-                if self.deployer.flow_name and not self.deployer.flow_name.startswith("mage-")
-                else None
-            )
-        )
+        flow_class_name = additional_info.get("mf_flow_class")
+        # Validate that mf_flow_class is a real Python class name (CamelCase, not a UUID).
+        # Pipeline UUIDs (e.g. "hello_from_deployment_user_npow_hellofromdeploymentflow")
+        # are stored as mf_flow_class when recovered from a plain identifier, but they
+        # can't be used as pathspecs. Use "UNKNOWN" to trigger datastore scan in .run.
+        if flow_class_name and (
+            "_" in flow_class_name  # pipeline UUIDs always have underscores
+            or not flow_class_name[0].isupper()  # class names start with uppercase
+        ):
+            flow_class_name = None
         if not flow_class_name:
             flow_class_name = "UNKNOWN"
         pathspec = "%s/%s" % (flow_class_name, run_id)
@@ -368,6 +370,26 @@ class MageDeployedFlow(DeployedFlow):
             mage_project = os.environ.get("MAGE_PROJECT", "metaflow_project")
             pipeline_uuid = flow_name_to_pipeline_uuid(flow_name)
 
+            # Cap.SCHEDULE_METADATA: fetch schedule_id and schedule_token from Mage API
+            # so that _trigger_direct can trigger the pipeline without needing a flow file.
+            schedule_id = None
+            schedule_token = None
+            try:
+                import requests as _req
+                resp = _req.get(
+                    "%s/api/pipelines/%s/pipeline_schedules" % (mage_host, pipeline_uuid),
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code == 200 and "error" not in resp.json():
+                    schedules = resp.json().get("pipeline_schedules", [])
+                    for sched in schedules:
+                        if sched.get("schedule_type") == "api" and sched.get("status") == "active":
+                            schedule_id = str(sched["id"])
+                            schedule_token = sched["token"]
+                            break
+            except Exception:
+                pass
+
             deployer = _make_stub_deployer(identifier)
             deployer.name = identifier
             deployer.flow_name = flow_name
@@ -377,6 +399,8 @@ class MageDeployedFlow(DeployedFlow):
                 "mage_host": mage_host,
                 "mage_project": mage_project,
                 "mf_flow_class": flow_name,
+                "schedule_id": schedule_id,
+                "schedule_token": schedule_token,
             }
 
         return cls(deployer=deployer)

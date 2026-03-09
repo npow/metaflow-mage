@@ -267,6 +267,10 @@ class MageCompiler:
         for tag in self.tags:
             tag_args += '        "--tag", %r,\n' % tag
 
+        # Build parameter names list for passing flow Parameters from pipeline variables
+        params = self._get_parameters()
+        param_names_repr = repr(list(params.keys()))
+
         return '''import hashlib
 import os
 import subprocess
@@ -288,6 +292,22 @@ def metaflow_init(*args, **kwargs):
     env["MF_RUN_ID"] = run_id
     env["MF_PIPELINE_RUN_ID"] = pipeline_run_id
 
+    # Cap.PARAMETERS: pass flow Parameters from Mage pipeline variables to init command
+    # Mage passes pipeline variables (set at trigger time) via kwargs.
+    # We forward them as --<param_name> <value> CLI args to `metaflow init`.
+    param_names = {param_names_repr}
+    param_args = []
+    # kwargs may contain 'variables' dict (from Mage pipeline_run variables) or direct keys
+    variables = kwargs.get('variables', {{}})
+    if not variables and kwargs:
+        variables = {{k: v for k, v in kwargs.items()
+                     if k not in ('pipeline_run_id', 'context', 'block_uuid', 'event',
+                                  'configuration', 'spark', 'logger', 'run_started_at')}}
+    for pname in param_names:
+        val = variables.get(pname)
+        if val is not None:
+            param_args += ["--" + pname, str(val)]
+
     # Initialize the Metaflow run (creates _parameters artifact, registers run)
     cmd = [
         sys.executable,
@@ -300,7 +320,7 @@ def metaflow_init(*args, **kwargs):
         "init",
         "--run-id", run_id,
         "--task-id", "mage-params",
-{tag_args}    ]
+{tag_args}    ] + param_args
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         print("STDOUT:", result.stdout[-2000:])
@@ -315,6 +335,7 @@ def metaflow_init(*args, **kwargs):
             metadata_type=self._metadata_type,
             datastore_type=self._datastore_type,
             tag_args=tag_args,
+            param_names_repr=param_names_repr,
             datastore_root_line=(
                 '        "--datastore-root", %r,\n' % self._datastore_root
                 if self._datastore_root else ""
@@ -367,6 +388,13 @@ def metaflow_init(*args, **kwargs):
         env_lines: str,
     ) -> str:
         """Render a block that runs one Metaflow step as a subprocess."""
+        # Detect if this is a foreach body step:
+        # is_inside_foreach=True and at least one parent has type "foreach"
+        is_foreach_body = (
+            getattr(step_node, "is_inside_foreach", False)
+            and step_node.type not in ("join",)
+        )
+
         # Build the top-level command parts (before "step" subcommand)
         top_parts = [
             "sys.executable",
@@ -405,6 +433,132 @@ def metaflow_init(*args, **kwargs):
 
         top_cmd_list = "[\n        %s,\n    ]" % ",\n        ".join(top_parts)
         step_cmd_list = "[\n        %s,\n    ]" % ",\n        ".join(step_parts)
+
+        if is_foreach_body:
+            # Cap.FOREACH_SPLIT_INDEX: foreach body steps must run once per item.
+            # The foreach step output contains foreach_count; we loop over all items,
+            # running the step subprocess with --split-index <i> and a per-item task_id.
+            # The join block expects task_ids of the form: run_id + '-' + step_name + '-' + str(i)
+            #
+            # input_paths_code uses 4-space indentation; inside the loop we need 8 spaces.
+            indented_input_paths_code = "    " + input_paths_code.rstrip("\n").replace("\n    ", "\n        ")
+            return '''import os
+import subprocess
+import sys
+
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+
+
+@custom
+def run_{step_name}(*args, **kwargs):
+    """Execute Metaflow foreach body step: {step_name} (runs once per foreach item)"""
+    # Get run_id and foreach_count from upstream block output
+    upstream_output = args[0] if args else {{}}
+    if isinstance(upstream_output, dict):
+        run_id = upstream_output.get("mf_run_id") or upstream_output.get("run_id")
+        foreach_count = int(upstream_output.get("foreach_count", 1))
+    else:
+        run_id = str(upstream_output) if upstream_output else None
+        foreach_count = 1
+
+    if not run_id:
+        raise RuntimeError("No run_id found from upstream block output")
+
+    params_task_id = "mage-params"
+    # Cap.RETRY: derive retry_count from Mage block attempt number
+    retry_count = kwargs.get("context", {{}}).get("retry_count", 0) if kwargs else 0
+
+    env = os.environ.copy()
+{env_lines}
+    env["MF_RUN_ID"] = run_id
+
+    top_cmd = {top_cmd_list}
+
+    # Cap.FOREACH_SPLIT_INDEX: run the step once per foreach item
+    for split_index in range(foreach_count):
+        # Per-item task_id: join block expects run_id + '-' + step_name + '-' + str(i)
+        task_id = run_id + "-" + {step_name_repr} + "-" + str(split_index)
+        # input_paths: parent foreach step task (task_id for parent is "mage-1")
+        input_paths = run_id + "/" + {parent_step_repr} + "/mage-1"
+        step_cmd = {step_cmd_list}
+        step_cmd += ["--split-index", str(split_index)]
+        step_cmd += ["--input-paths", input_paths]
+        cmd = top_cmd + step_cmd
+
+        print("Running {step_name} split_index=%d (task_id=%s)" % (split_index, task_id))
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("STDOUT:", result.stdout[-4000:])
+            print("STDERR:", result.stderr[-4000:])
+            raise RuntimeError(
+                "Metaflow step {step_name!r} split_index=%d failed (exit %d): %s"
+                % (split_index, result.returncode, result.stderr[-500:])
+            )
+        if result.stdout:
+            print("STDOUT:", result.stdout[-2000:])
+
+    print("Step {step_name} completed all %d foreach items" % foreach_count)
+    return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"}}
+'''.format(
+                step_name=step_name,
+                step_name_repr=repr(step_name),
+                parent_step_repr=repr(list(step_node.in_funcs)[0] if step_node.in_funcs else ""),
+                env_lines=env_lines,
+                top_cmd_list=top_cmd_list,
+                step_cmd_list=step_cmd_list,
+            )
+
+        # For foreach steps, we need to read _foreach_num_splits after execution
+        is_foreach_step = (step_node.type == "foreach")
+        foreach_count_code = ""
+        foreach_return_field = ""
+        if is_foreach_step:
+            # Read _foreach_num_splits directly from the local datastore files.
+            # The task datastore stores artifacts as content-addressed blobs:
+            #   <sysroot>/.metaflow/<flow>/<run_id>/<step>/<task_id>/0.data.json
+            #     -> maps "_foreach_num_splits" -> CA key
+            #   <sysroot>/.metaflow/<flow>/data/<key[:2]>/<key>
+            #     -> gzip+pickle blob of the actual value
+            foreach_count_code = (
+                '\n'
+                '    # Cap.FOREACH_COUNT: read _foreach_num_splits from the local datastore\n'
+                '    # so the downstream body block knows how many items to process.\n'
+                '    foreach_count = 1\n'
+                '    try:\n'
+                '        import gzip as _gz\n'
+                '        import json as _json\n'
+                '        import os as _os\n'
+                '        import pickle as _pickle\n'
+                '        _sysroot = env.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")\n'
+                '        _mf_root = _os.path.join(_sysroot, ".metaflow") if _sysroot else ""\n'
+                '        _data_json = _os.path.join(\n'
+                '            _mf_root, %s, run_id, %s, task_id, "0.data.json"\n'
+                '        )\n'
+                '        if _os.path.isfile(_data_json):\n'
+                '            with open(_data_json) as _f:\n'
+                '                _objects = _json.load(_f).get("objects", {})\n'
+                '            _ca_key = _objects.get("_foreach_num_splits")\n'
+                '            if _ca_key:\n'
+                '                _blob_path = _os.path.join(\n'
+                '                    _mf_root, %s, "data", _ca_key[:2], _ca_key\n'
+                '                )\n'
+                '                with open(_blob_path, "rb") as _f:\n'
+                '                    _blob = _f.read()\n'
+                '                try:\n'
+                '                    foreach_count = int(_pickle.loads(_gz.decompress(_blob)))\n'
+                '                except Exception:\n'
+                '                    foreach_count = int(_pickle.loads(_blob))\n'
+                '                print("Foreach step %s: %%d items" %% foreach_count)\n'
+                '    except Exception as _e:\n'
+                '        print("Warning: could not read _foreach_num_splits: %%s" %% _e)\n'
+            ) % (
+                repr(self.name),
+                repr(step_name),
+                repr(self.name),
+                step_name,
+            )
+            foreach_return_field = ', "foreach_count": foreach_count'
 
         return '''import os
 import subprocess
@@ -455,13 +609,16 @@ def run_{step_name}(*args, **kwargs):
     print("Step {step_name} completed successfully")
     if result.stdout:
         print("STDOUT:", result.stdout[-2000:])
-    return {{"run_id": run_id, "step": {step_name!r}, "status": "success"}}
+{foreach_count_code}
+    return {{"run_id": run_id, "step": {step_name!r}, "status": "success"{foreach_return_field}}}
 '''.format(
             step_name=step_name,
             env_lines=env_lines,
             input_paths_code=input_paths_code,
             top_cmd_list=top_cmd_list,
             step_cmd_list=step_cmd_list,
+            foreach_count_code=foreach_count_code,
+            foreach_return_field=foreach_return_field,
         )
 
     def _block_prefix(self) -> str:

@@ -461,24 +461,29 @@ def _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj
             )
         obj.echo("  Created block *%s*" % block["name"])
 
-    # Phase 2: Set upstream_blocks for each block (now that all blocks exist).
+    # Phase 2: Update content and set upstream_blocks for each block.
+    # Block files are SHARED in Mage (stored in custom/ by name), so even when we
+    # delete+recreate a block, the file on disk may not be updated unless we
+    # explicitly PUT the new content.
     for block in blocks:
-        if not block["upstream_blocks"]:
-            continue
+        update_payload = {}
+        if block["upstream_blocks"]:
+            update_payload["upstream_blocks"] = block["upstream_blocks"]
+        # Always update content to ensure re-deployments pick up changes
+        update_payload["content"] = block["content"]
         update_resp = client.put(
             "%s/api/pipelines/%s/blocks/%s" % (host, pipeline_uuid, block["name"]),
-            json={
-                "block": {
-                    "upstream_blocks": block["upstream_blocks"],
-                }
-            },
+            json={"block": update_payload},
         )
         if update_resp.status_code not in (200, 201):
             raise MageException(
-                "Failed to set upstream_blocks for block %r (HTTP %d): %s"
+                "Failed to update block %r (HTTP %d): %s"
                 % (block["name"], update_resp.status_code, update_resp.text[:300])
             )
-        obj.echo("  Set upstream for *%s* -> %s" % (block["name"], block["upstream_blocks"]))
+        if block["upstream_blocks"]:
+            obj.echo("  Set upstream for *%s* -> %s" % (block["name"], block["upstream_blocks"]))
+        else:
+            obj.echo("  Updated block *%s*" % block["name"])
 
     obj.echo("Pipeline *%s* deployed successfully." % pipeline_uuid)
 
