@@ -34,7 +34,13 @@ def _validate_workflow(flow, graph):
     for node in graph:
         if node.parallel_foreach:
             raise NotSupportedException(
-                "Step *%s* uses @parallel which is not supported with Mage." % node.name
+                "Step *%s* uses @parallel, which requires MPI-style collective communication "
+                "across N workers that share a barrier at each step. "
+                "Mage blocks are independent processes with no shared-memory or inter-block "
+                "communication channel during execution, so the collective semantics "
+                "(@parallel workers calling current.parallel.* to exchange data) cannot be "
+                "reproduced. This is a fundamental architectural mismatch, not a missing "
+                "implementation." % node.name
             )
 
 
