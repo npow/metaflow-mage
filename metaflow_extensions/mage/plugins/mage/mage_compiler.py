@@ -43,11 +43,11 @@ if 'custom' not in globals():
 # Inline Python snippet that reads _foreach_num_splits via FlowDataStore API.
 # Embedded directly in generated block code — no subprocess needed.
 _FOREACH_NUM_SPLITS_READER_SNIPPET = '''\
-    from metaflow.datastore import FlowDataStore as _FDS
-    from metaflow.plugins import DATASTORES as _DATASTORES
-    _ds_impl = next(_d for _d in _DATASTORES if _d.TYPE == env.get("METAFLOW_DEFAULT_DATASTORE", "local"))
-    _ds_root = _ds_impl.get_datastore_root_from_config(lambda *a: None)
-    _fds = _FDS({flow_name!r}, None, storage_impl=_ds_impl, ds_root=_ds_root)
+        from metaflow.datastore import FlowDataStore as _FDS
+        from metaflow.plugins import DATASTORES as _DATASTORES
+        _ds_impl = next(_d for _d in _DATASTORES if _d.TYPE == env.get("METAFLOW_DEFAULT_DATASTORE", "local"))
+        _ds_root = _ds_impl.get_datastore_root_from_config(lambda *a: None)
+        _fds = _FDS({flow_name!r}, None, storage_impl=_ds_impl, ds_root=_ds_root)
 '''
 
 
