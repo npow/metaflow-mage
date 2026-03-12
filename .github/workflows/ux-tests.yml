@@ -77,6 +77,7 @@ jobs:
           - test_branch
           - test_foreach
           - test_nested_foreach
+          - test_timeout_enforcement
 
     steps:
       - uses: actions/checkout@v4
