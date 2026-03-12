@@ -471,6 +471,8 @@ def _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj
             update_payload["upstream_blocks"] = block["upstream_blocks"]
         # Always update content to ensure re-deployments pick up changes
         update_payload["content"] = block["content"]
+        if block.get("timeout"):
+            update_payload["timeout"] = block["timeout"]
         update_resp = client.put(
             "%s/api/pipelines/%s/blocks/%s" % (host, pipeline_uuid, block["name"]),
             json={"block": update_payload},
