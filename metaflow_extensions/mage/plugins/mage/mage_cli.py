@@ -471,9 +471,6 @@ def _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj
             update_payload["upstream_blocks"] = block["upstream_blocks"]
         # Always update content to ensure re-deployments pick up changes
         update_payload["content"] = block["content"]
-        # Pass retry_config and timeout to Mage so it uses native retry/timeout
-        if block.get("retry_config"):
-            update_payload["retry_config"] = block["retry_config"]
         if block.get("timeout"):
             update_payload["timeout"] = block["timeout"]
         update_resp = client.put(

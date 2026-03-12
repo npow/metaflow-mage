@@ -300,7 +300,6 @@ class MageCompiler:
         name: str,
         upstream: List[str],
         content: str,
-        retry_config: Optional[Dict[str, Any]] = None,
         timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Build a Mage block definition dict."""
@@ -311,8 +310,6 @@ class MageCompiler:
             "upstream_blocks": upstream,
             "content": content,
         }
-        if retry_config:
-            block["retry_config"] = retry_config
         if timeout:
             block["timeout"] = timeout
         return block
@@ -374,7 +371,7 @@ class MageCompiler:
         """Return the shared preamble used by all step block templates.
 
         Includes: header, @custom decorator, function def, upstream parsing,
-        env setup, retry_count from Mage kwargs, and top_cmd assignment.
+        env setup, max_retries, and top_cmd assignment.
         """
         timeout_line = ""
         if timeout_seconds:
@@ -384,9 +381,7 @@ class MageCompiler:
 def run_{step_name}(*args, **kwargs):
     """{docstring}"""
 {upstream_parsing}
-    # Derive retry_count from Mage's native retry mechanism.
-    # Mage passes retry context in kwargs when retry_config is set on the block.
-    retry_count = int((kwargs.get('retry') or {{}}).get('current_retry_count', 0)){timeout_line}
+    max_retries = {max_retries}{timeout_line}
 
     env = os.environ.copy()
 {env_lines}
@@ -398,6 +393,7 @@ def run_{step_name}(*args, **kwargs):
             step_name=step_name,
             docstring=docstring,
             upstream_parsing=upstream_parsing,
+            max_retries=max_retries,
             env_lines=env_lines,
             top_cmd_list=top_cmd_list,
             timeout_line=timeout_line,
@@ -624,14 +620,21 @@ def metaflow_init(*args, **kwargs):
     for split_index in range(foreach_count):
         task_id = run_id + "-" + {step_name_repr} + "-" + str(split_index)
         input_paths = run_id + "/" + {parent_step_repr} + "/mage-1"
-        step_cmd = {step_cmd_list}
-        step_cmd += ["--split-index", str(split_index)]
-        step_cmd += ["--input-paths", input_paths]
-        cmd = top_cmd + step_cmd
+        for retry_count in range(max_retries + 1):
+            step_cmd = {step_cmd_list}
+            step_cmd += ["--split-index", str(split_index)]
+            step_cmd += ["--input-paths", input_paths]
+            cmd = top_cmd + step_cmd
 
-        print("Running {step_name} split_index=%d retry=%d (task_id=%s)" % (split_index, retry_count, task_id))
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
-        if result.returncode != 0:
+            print("Running {step_name} split_index=%d retry=%d (task_id=%s)" % (split_index, retry_count, task_id))
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+            if result.returncode == 0:
+                break
+            if retry_count < max_retries:
+                print("Step {step_name} split_index=%d failed on attempt %d, retrying..." % (split_index, retry_count))
+                if result.stderr:
+                    print("STDERR:", result.stderr[-2000:])
+                continue
             print("STDOUT:", result.stdout[-4000:])
             print("STDERR:", result.stderr[-4000:])
             raise RuntimeError(
@@ -690,14 +693,21 @@ def metaflow_init(*args, **kwargs):
         for inner_j in range(inner_count):
             task_id = run_id + "-" + {step_name_repr} + "-" + str(outer_i) + "-" + str(inner_j)
             input_paths = run_id + "/" + {parent_step_repr} + "/" + parent_task_id
-            step_cmd = {step_cmd_list}
-            step_cmd += ["--split-index", str(inner_j)]
-            step_cmd += ["--input-paths", input_paths]
-            cmd = top_cmd + step_cmd
+            for retry_count in range(max_retries + 1):
+                step_cmd = {step_cmd_list}
+                step_cmd += ["--split-index", str(inner_j)]
+                step_cmd += ["--input-paths", input_paths]
+                cmd = top_cmd + step_cmd
 
-            print("Running {step_name} outer=%d inner=%d retry=%d (task_id=%s)" % (outer_i, inner_j, retry_count, task_id))
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
-            if result.returncode != 0:
+                print("Running {step_name} outer=%d inner=%d retry=%d (task_id=%s)" % (outer_i, inner_j, retry_count, task_id))
+                result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+                if result.returncode == 0:
+                    break
+                if retry_count < max_retries:
+                    print("Step {step_name} outer=%d inner=%d failed on attempt %d, retrying..." % (outer_i, inner_j, retry_count))
+                    if result.stderr:
+                        print("STDERR:", result.stderr[-2000:])
+                    continue
                 print("STDOUT:", result.stdout[-4000:])
                 print("STDERR:", result.stderr[-4000:])
                 raise RuntimeError(
@@ -755,13 +765,20 @@ def metaflow_init(*args, **kwargs):
             run_id + "/" + {parent_step_repr} + "/" + run_id + "-" + {parent_step_repr} + "-" + str(outer_i) + "-" + str(j)
             for j in range(inner_count)
         )
-        step_cmd = {step_cmd_list}
-        step_cmd += ["--input-paths", input_paths]
-        cmd = top_cmd + step_cmd
+        for retry_count in range(max_retries + 1):
+            step_cmd = {step_cmd_list}
+            step_cmd += ["--input-paths", input_paths]
+            cmd = top_cmd + step_cmd
 
-        print("Running {step_name} outer=%d retry=%d (task_id=%s)" % (outer_i, retry_count, task_id))
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
-        if result.returncode != 0:
+            print("Running {step_name} outer=%d retry=%d (task_id=%s)" % (outer_i, retry_count, task_id))
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+            if result.returncode == 0:
+                break
+            if retry_count < max_retries:
+                print("Step {step_name} outer=%d failed on attempt %d, retrying..." % (outer_i, retry_count))
+                if result.stderr:
+                    print("STDERR:", result.stderr[-2000:])
+                continue
             print("STDOUT:", result.stdout[-4000:])
             print("STDERR:", result.stderr[-4000:])
             raise RuntimeError(
@@ -818,13 +835,20 @@ def metaflow_init(*args, **kwargs):
 
     # Compute input_paths for this step
 {input_paths_code}
-    step_cmd = {step_cmd_list}
-    if input_paths:
-        step_cmd += ["--input-paths", input_paths]
-    cmd = top_cmd + step_cmd
+    for retry_count in range(max_retries + 1):
+        step_cmd = {step_cmd_list}
+        if input_paths:
+            step_cmd += ["--input-paths", input_paths]
+        cmd = top_cmd + step_cmd
 
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
-    if result.returncode != 0:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+        if result.returncode == 0:
+            break
+        if retry_count < max_retries:
+            print("Step {step_name} failed on attempt %d, retrying (%d/%d)..." % (retry_count, retry_count + 1, max_retries))
+            if result.stderr:
+                print("STDERR:", result.stderr[-2000:])
+            continue
         print("STDOUT:", result.stdout[-4000:])
         print("STDERR:", result.stderr[-4000:])
         raise RuntimeError(
@@ -931,13 +955,10 @@ def metaflow_init(*args, **kwargs):
 
             content = self._render_step_block_content(step_name, node, step_env_lines)
 
-            max_retries = self._get_max_user_code_retries(node)
-            retry_cfg = {"retries": max_retries, "delay": 0} if max_retries > 0 else None
             timeout_sec = self._get_timeout_seconds(node)
 
             blocks.append(self._make_block_dict(
                 block_name, upstream, content,
-                retry_config=retry_cfg,
                 timeout=timeout_sec,
             ))
 
