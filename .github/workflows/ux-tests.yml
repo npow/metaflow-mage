@@ -98,15 +98,15 @@ jobs:
           - test_timeout_enforcement
           - test_timeout_minutes_enforced
           - test_run_param_not_dropped
-          - test_retry_count_from_scheduler
           - test_branch_propagated_to_steps
           - test_run_params_multiple_values
           - test_config_value_propagated
+          # test_retry_count_from_scheduler runs inside test_retry (3rd test) so
+          # the Mage block worker is already warm from the first two tests.
+          # Running it in isolation causes the worker to not start in time.
         include:
-          # Compliance tests share name substrings with general entries, causing
-          # them to be collected twice. Override the general entry filter to exclude them.
-          - test: test_retry
-            filter: "test_retry and deployer and not count_from_scheduler"
+          # test_branch's filter would also pick up test_branch_propagated_to_steps.
+          # Give the compliance test its own job and exclude it here.
           - test: test_branch
             filter: "test_branch and deployer and not propagated"
 
