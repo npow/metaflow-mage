@@ -74,6 +74,7 @@ def _make_compiler(
     mage_project="metaflow_project",
     environment_type="local",
     step_objs=None,
+    max_workers=10,
 ):
     """Return a MageCompiler with mock dependencies.
 
@@ -101,6 +102,7 @@ def _make_compiler(
         monitor=monitor,
         mage_host=mage_host,
         mage_project=mage_project,
+        max_workers=max_workers,
     )
 
 
@@ -343,3 +345,115 @@ class TestGeneratedCodeSyntax:
         env_lines = c._format_env_lines({})
         code = c._render_step_block_content("flaky", node, env_lines)
         ast.parse(code)
+
+
+# ---------------------------------------------------------------------------
+# Tests: generated parallel foreach code structure
+# ---------------------------------------------------------------------------
+
+class TestParallelForeachCodeStructure:
+    """Structural assertions on the generated ThreadPoolExecutor foreach code."""
+
+    def _foreach_body_code(self, timeout_seconds=None, max_workers=10):
+        """Generate a foreach body block and return its code string."""
+        decos = []
+        if timeout_seconds:
+            decos.append(_make_deco("timeout", {"seconds": timeout_seconds, "minutes": 0, "hours": 0}))
+        node = _make_step_node("process", is_inside_foreach=True, in_funcs=["start"], split_parents=["start"], decorators=decos)
+        step_obj = _make_step_obj("process", decorators=decos)
+        c = _make_compiler(steps=[node], step_objs=[step_obj], max_workers=max_workers)
+        env_lines = c._format_env_lines({})
+        return c._render_step_block_content("process", node, env_lines)
+
+    def test_threadpoolexecutor_present(self):
+        """Generated foreach body must use ThreadPoolExecutor."""
+        code = self._foreach_body_code()
+        assert "ThreadPoolExecutor" in code, "ThreadPoolExecutor missing from foreach body block"
+
+    def test_as_completed_present(self):
+        """Generated foreach body must use as_completed to collect all exceptions."""
+        code = self._foreach_body_code()
+        assert "as_completed" in code, "as_completed missing — only first exception would propagate"
+
+    def test_max_workers_embedded(self):
+        """max_workers value must be embedded in generated code."""
+        code = self._foreach_body_code(max_workers=7)
+        assert "max_workers=7" in code, "max_workers=7 not found in generated foreach body"
+
+    def test_cancel_futures_present(self):
+        """shutdown(cancel_futures=True) must be in generated code to avoid draining pending futures."""
+        code = self._foreach_body_code()
+        assert "cancel_futures=True" in code, "cancel_futures=True missing — pool drains on failure"
+
+    def test_errors_collected_before_raise(self):
+        """All split exceptions must be collected before raising (not raise-on-first)."""
+        code = self._foreach_body_code()
+        assert "_errors" in code, "_errors list missing — only first exception propagates"
+        assert "_errors.append" in code, "_errors.append missing"
+
+    def test_timeout_uses_deadline_not_static(self):
+        """When @timeout is set, subprocess.run must use _deadline remainder, not static _timeout."""
+        code = self._foreach_body_code(timeout_seconds=60)
+        assert "_deadline" in code, "_deadline missing from preamble"
+        assert "timeout=max(0.1, _deadline - time.monotonic())" in code, (
+            "subprocess.run uses static timeout=_timeout instead of deadline-aware remaining time"
+        )
+
+    def test_timeout_expired_handler_present(self):
+        """subprocess.TimeoutExpired must be caught to kill the child process."""
+        code = self._foreach_body_code(timeout_seconds=30)
+        assert "subprocess.TimeoutExpired" in code, "TimeoutExpired handler missing"
+        assert "_te.process.kill()" in code, "child process kill missing on timeout"
+
+    def test_foreach_count_zero_guard(self):
+        """foreach_count=0 must return early, not submit zero futures silently."""
+        code = self._foreach_body_code()
+        assert "foreach_count == 0" in code or "not _task_pairs" in code, (
+            "No guard for foreach_count=0 — block returns false success on empty foreach"
+        )
+
+    def test_syntax_with_max_workers(self):
+        """Generated code must be syntactically valid with custom max_workers."""
+        import ast
+        code = self._foreach_body_code(max_workers=5)
+        ast.parse(code)
+
+    def test_syntax_with_timeout_and_retry(self):
+        """Generated code must be syntactically valid with both @timeout and @retry."""
+        import ast
+        timeout_deco = _make_deco("timeout", {"seconds": 30, "minutes": 0, "hours": 0})
+        retry_deco = _make_deco("retry", {"times": 2})
+        node = _make_step_node("flaky", is_inside_foreach=True, in_funcs=["start"],
+                               split_parents=["start"], decorators=[timeout_deco, retry_deco])
+        step_obj = _make_step_obj("flaky", decorators=[timeout_deco, retry_deco])
+        c = _make_compiler(steps=[node], step_objs=[step_obj])
+        env_lines = c._format_env_lines({})
+        code = c._render_step_block_content("flaky", node, env_lines)
+        ast.parse(code)
+
+
+# ---------------------------------------------------------------------------
+# Tests: generated init block correctness
+# ---------------------------------------------------------------------------
+
+class TestGeneratedInitBlock:
+    def _init_block(self):
+        c = _make_compiler()
+        env_lines = c._format_env_lines({"METAFLOW_DEFAULT_METADATA": "local"})
+        return c._render_init_block_content(env_lines)
+
+    def test_pipeline_run_id_uses_is_none_check(self):
+        """D-INIT-FALSY: must use `is None` not falsy check to allow integer 0."""
+        code = self._init_block()
+        assert "pipeline_run_id is None" in code, (
+            "Init block uses `if not pipeline_run_id` which incorrectly raises for "
+            "integer 0. Should use `if pipeline_run_id is None`."
+        )
+        # Negative: ensure the falsy pattern is NOT present
+        assert "if not pipeline_run_id" not in code, (
+            "`if not pipeline_run_id` found — this fires for integer 0, a valid Mage run ID"
+        )
+
+    def test_init_block_syntax(self):
+        import ast
+        ast.parse(self._init_block())

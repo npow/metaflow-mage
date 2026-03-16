@@ -109,6 +109,10 @@ jobs:
           # Give the compliance test its own job and exclude it here.
           - test: test_branch
             filter: "test_branch and deployer and not propagated"
+          # test_config_simple_config's filter would also match test_config_simple_config_value
+          # (substring). That test has its own dedicated matrix slot, so exclude it here.
+          - test: test_config_simple_config
+            filter: "test_config_simple_config and deployer and not config_value_propagated and not config_simple_config_value"
 
     steps:
       - uses: actions/checkout@v4

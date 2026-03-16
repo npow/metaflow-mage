@@ -19,6 +19,27 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+# Credential-class environment variable keys that must never be baked as literals
+# into generated block source code. These are resolved at runtime from the Mage
+# worker's environment via `env = os.environ.copy()` in every generated block.
+_SENSITIVE_KEYS = frozenset({
+    # Static AWS credentials
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    # ECS task credentials (container metadata endpoint)
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    # IRSA (IAM Roles for Service Accounts)
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    # Metaflow service auth tokens
+    "METAFLOW_SERVICE_AUTH_KEY",
+    "METAFLOW_SERVICE_TOKEN",
+})
+
 
 def flow_name_to_pipeline_uuid(name: str) -> str:
     """Convert a Metaflow flow name to a Mage pipeline UUID (lowercase, underscores)."""
@@ -232,14 +253,6 @@ class MageCompiler:
         # starts with `env = os.environ.copy()`, so the Mage worker's own runtime
         # credentials are already captured there. Baking them as string literals
         # would expose secrets in block source files stored on the Mage server.
-        _SENSITIVE_KEYS = frozenset({
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SESSION_TOKEN",
-            "AWS_SECURITY_TOKEN",
-            "METAFLOW_SERVICE_AUTH_KEY",
-            "METAFLOW_SERVICE_TOKEN",
-        })
         for key, val in os.environ.items():
             if key in _SENSITIVE_KEYS:
                 continue
@@ -280,7 +293,12 @@ class MageCompiler:
             for deco in step_obj.decorators:
                 if deco.name == "environment":
                     for key, value in deco.attributes.get("vars", {}).items():
+                        if key in _SENSITIVE_KEYS:
+                            continue  # never bake credential keys from @environment
                         try:
+                            if callable(value):
+                                # config_expr / lambda — cannot be resolved at compile time
+                                continue
                             env[key] = str(value)
                         except Exception:
                             pass
@@ -577,7 +595,7 @@ def run_{step_name}(*args, **kwargs):
 def metaflow_init(*args, **kwargs):
     """Initialize a Metaflow run: compute run_id and call `metaflow init`."""
     pipeline_run_id = kwargs.get('pipeline_run_id')
-    if not pipeline_run_id:
+    if pipeline_run_id is None:
         raise RuntimeError(
             "pipeline_run_id not injected by Mage — cannot compute a stable run_id. "
             "Ensure the pipeline is triggered via the Mage schedule API, not manually."
@@ -666,10 +684,14 @@ def metaflow_init(*args, **kwargs):
             timeout_seconds=timeout_seconds,
         )
 
-        timeout_kwarg = ", timeout=_timeout" if timeout_seconds else ""
+        timeout_kwarg = ", timeout=max(0.1, _deadline - time.monotonic())" if timeout_seconds else ""
 
         return '''{preamble}
-    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+
+    if foreach_count == 0:
+        print("Step {step_name}: foreach_count=0 (empty foreach list), skipping.")
+        return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": 0, "status": "success"{foreach_return_extra}}}
 
     def _run_one_split(split_index):
         task_id = run_id + "-" + {step_name_repr} + "-" + str(split_index)
@@ -702,9 +724,22 @@ def metaflow_init(*args, **kwargs):
                 % (split_index, result.returncode, result.stderr[-500:])
             )
 
-    with _TPE(max_workers={max_workers}) as _pool:
-        for _f in [_pool.submit(_run_one_split, i) for i in range(foreach_count)]:
-            _f.result()  # re-raises any exception from workers
+    _pool_ex = _TPE(max_workers={max_workers})
+    try:
+        _all_futures = [_pool_ex.submit(_run_one_split, i) for i in range(foreach_count)]
+        _errors = []
+        for _f in _ac(_all_futures):
+            try:
+                _f.result()
+            except Exception as _e:
+                _errors.append(str(_e))
+        if _errors:
+            raise RuntimeError(
+                "Step {step_name!r}: %d/%d splits failed:\\n%s"
+                % (len(_errors), foreach_count, "\\n---\\n".join(_errors))
+            )
+    finally:
+        _pool_ex.shutdown(wait=True, cancel_futures=True)
 
     task_id = run_id + "-" + {step_name_repr} + "-0"  # for foreach count reader below
 {foreach_read_code}
@@ -748,10 +783,10 @@ def metaflow_init(*args, **kwargs):
             timeout_seconds=timeout_seconds,
         )
 
-        timeout_kwarg = ", timeout=_timeout" if timeout_seconds else ""
+        timeout_kwarg = ", timeout=max(0.1, _deadline - time.monotonic())" if timeout_seconds else ""
 
         return '''{preamble}
-    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
 
     def _run_one_task(outer_i, inner_j):
         parent_task_id = run_id + "-" + {parent_step_repr} + "-" + str(outer_i)
@@ -790,9 +825,25 @@ def metaflow_init(*args, **kwargs):
         for oi in range(foreach_count)
         for ij in range(nested_foreach_counts[oi] if oi < len(nested_foreach_counts) else 1)
     ]
-    with _TPE(max_workers={max_workers}) as _pool:
-        for _f in [_pool.submit(_run_one_task, oi, ij) for oi, ij in _task_pairs]:
-            _f.result()
+    if not _task_pairs:
+        return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "nested_foreach_counts": nested_foreach_counts, "status": "success"{nested_return_extra}}}
+
+    _pool_ex = _TPE(max_workers={max_workers})
+    try:
+        _all_futures = [_pool_ex.submit(_run_one_task, oi, ij) for oi, ij in _task_pairs]
+        _errors = []
+        for _f in _ac(_all_futures):
+            try:
+                _f.result()
+            except Exception as _e:
+                _errors.append(str(_e))
+        if _errors:
+            raise RuntimeError(
+                "Step {step_name!r}: %d/%d tasks failed:\\n%s"
+                % (len(_errors), len(_task_pairs), "\\n---\\n".join(_errors))
+            )
+    finally:
+        _pool_ex.shutdown(wait=True, cancel_futures=True)
 
 {nested_read_code}
     print("Step {step_name} completed all nested foreach items")
@@ -833,10 +884,10 @@ def metaflow_init(*args, **kwargs):
             timeout_seconds=timeout_seconds,
         )
 
-        timeout_kwarg = ", timeout=_timeout" if timeout_seconds else ""
+        timeout_kwarg = ", timeout=max(0.1, _deadline - time.monotonic())" if timeout_seconds else ""
 
         return '''{preamble}
-    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
 
     def _run_one_join(outer_i):
         inner_count = nested_foreach_counts[outer_i] if outer_i < len(nested_foreach_counts) else 1
@@ -872,9 +923,25 @@ def metaflow_init(*args, **kwargs):
                 % (outer_i, result.returncode, result.stderr[-500:])
             )
 
-    with _TPE(max_workers={max_workers}) as _pool:
-        for _f in [_pool.submit(_run_one_join, i) for i in range(foreach_count)]:
-            _f.result()
+    if foreach_count == 0:
+        return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": 0, "status": "success"}}
+
+    _pool_ex = _TPE(max_workers={max_workers})
+    try:
+        _all_futures = [_pool_ex.submit(_run_one_join, i) for i in range(foreach_count)]
+        _errors = []
+        for _f in _ac(_all_futures):
+            try:
+                _f.result()
+            except Exception as _e:
+                _errors.append(str(_e))
+        if _errors:
+            raise RuntimeError(
+                "Step {step_name!r}: %d/%d join iterations failed:\\n%s"
+                % (len(_errors), foreach_count, "\\n---\\n".join(_errors))
+            )
+    finally:
+        _pool_ex.shutdown(wait=True, cancel_futures=True)
 
     print("Step {step_name} completed all %d join iterations" % foreach_count)
     return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"}}
@@ -916,7 +983,7 @@ def metaflow_init(*args, **kwargs):
             timeout_seconds=timeout_seconds,
         )
 
-        timeout_kwarg = ", timeout=_timeout" if timeout_seconds else ""
+        timeout_kwarg = ", timeout=max(0.1, _deadline - time.monotonic())" if timeout_seconds else ""
 
         return '''{preamble}
     params_task_id = "mage-params"

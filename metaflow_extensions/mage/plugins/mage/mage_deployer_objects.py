@@ -79,6 +79,7 @@ def _get_pipeline_run_status(host: str, pipeline_run_id: int) -> Optional[str]:
         resp = requests.get(
             "%s/api/pipeline_runs/%d" % (host, pipeline_run_id),
             headers={"Content-Type": "application/json"},
+            timeout=10,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -353,9 +354,10 @@ class MageDeployedFlow(DeployedFlow):
             # @project flows have dotted names like "project.branch.ClassName" — take last component
             if "." in flow_class_name:
                 flow_class_name = flow_class_name.split(".")[-1]
-            # After extracting last component, validate it's a Python class name:
-            # starts with uppercase letter, contains only alnum/underscore, not all-lowercase
-            if not (flow_class_name and flow_class_name[0].isupper() and flow_class_name.isidentifier()):
+            # Validate as a Python class name: non-empty, starts uppercase, valid identifier
+            if not flow_class_name:
+                flow_class_name = None
+            elif not (flow_class_name[0].isupper() and flow_class_name.isidentifier()):
                 flow_class_name = None
         if not flow_class_name:
             flow_class_name = "UNKNOWN"
