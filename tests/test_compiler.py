@@ -265,15 +265,7 @@ class TestParameterCollisionDetection:
 # Tests: generated block code does NOT contain credentials
 # ---------------------------------------------------------------------------
 
-_CRED_XFAIL = pytest.mark.xfail(
-    reason="D-CRED-1: _build_env_vars bakes AWS_* and METAFLOW_SERVICE* as literals. "
-           "Fix requires runtime credential resolution instead of compile-time embedding.",
-    strict=True,
-)
-
-
 class TestNoCredentialsInGeneratedCode:
-    @_CRED_XFAIL
     def test_aws_secret_not_in_block_content(self, monkeypatch):
         """D-CRED-1: AWS_SECRET_ACCESS_KEY must not appear as a literal in generated code."""
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "TESTSECRET12345")
@@ -293,7 +285,6 @@ class TestNoCredentialsInGeneratedCode:
                 "AWS_ACCESS_KEY_ID value found in block %r content" % block["name"]
             )
 
-    @_CRED_XFAIL
     def test_metaflow_service_auth_not_in_block(self, monkeypatch):
         """D-CRED-1: METAFLOW_SERVICE_AUTH_KEY must not appear as a literal."""
         monkeypatch.setenv("METAFLOW_SERVICE_AUTH_KEY", "supersecrettoken")

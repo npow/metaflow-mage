@@ -226,8 +226,22 @@ class MageCompiler:
                 or os.path.dirname(self._datastore_root)
             )
 
-        # Forward key Metaflow env vars from compile-time environment
+        # Forward key Metaflow env vars from compile-time environment.
+        # Credential-class keys are intentionally excluded: the generated block code
+        # starts with `env = os.environ.copy()`, so the Mage worker's own runtime
+        # credentials are already captured there. Baking them as string literals
+        # would expose secrets in block source files stored on the Mage server.
+        _SENSITIVE_KEYS = frozenset({
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
+            "METAFLOW_SERVICE_AUTH_KEY",
+            "METAFLOW_SERVICE_TOKEN",
+        })
         for key, val in os.environ.items():
+            if key in _SENSITIVE_KEYS:
+                continue
             if (
                 key.startswith("METAFLOW_SERVICE")
                 or key.startswith("METAFLOW_DEFAULT")
@@ -561,7 +575,13 @@ def run_{step_name}(*args, **kwargs):
 @custom
 def metaflow_init(*args, **kwargs):
     """Initialize a Metaflow run: compute run_id and call `metaflow init`."""
-    pipeline_run_id = str(kwargs.get('pipeline_run_id', 'unknown'))
+    pipeline_run_id = kwargs.get('pipeline_run_id')
+    if not pipeline_run_id:
+        raise RuntimeError(
+            "pipeline_run_id not injected by Mage — cannot compute a stable run_id. "
+            "Ensure the pipeline is triggered via the Mage schedule API, not manually."
+        )
+    pipeline_run_id = str(pipeline_run_id)
     run_id = "mage-" + hashlib.md5(pipeline_run_id.encode()).hexdigest()[:16]
 
     env = os.environ.copy()
