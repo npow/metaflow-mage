@@ -16,6 +16,7 @@ env:
   METAFLOW_DEFAULT_METADATA: local
   METAFLOW_DEFAULT_DATASTORE: local
   METAFLOW_DEFAULT_ENVIRONMENT: local
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # Fast unit tests that run without a Mage instance (compiler correctness, CLI helpers).

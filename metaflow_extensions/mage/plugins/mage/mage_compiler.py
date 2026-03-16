@@ -96,6 +96,7 @@ class MageCompiler:
         self.branch = branch
         self.production = production
         self._environment_type = getattr(environment, "TYPE", "local")
+        self.max_workers = max_workers
 
         self._project_info = self._get_project()
         self._flow_name = (
@@ -668,8 +669,9 @@ def metaflow_init(*args, **kwargs):
         timeout_kwarg = ", timeout=_timeout" if timeout_seconds else ""
 
         return '''{preamble}
-    # Run the step once per foreach item
-    for split_index in range(foreach_count):
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    def _run_one_split(split_index):
         task_id = run_id + "-" + {step_name_repr} + "-" + str(split_index)
         input_paths = run_id + "/" + {parent_step_repr} + "/mage-1"
         for retry_count in range(max_retries + 1):
@@ -677,7 +679,6 @@ def metaflow_init(*args, **kwargs):
             step_cmd += ["--split-index", str(split_index)]
             step_cmd += ["--input-paths", input_paths]
             cmd = top_cmd + step_cmd
-
             print("Running {step_name} split_index=%d retry=%d (task_id=%s)" % (split_index, retry_count, task_id))
             try:
                 result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
@@ -686,7 +687,9 @@ def metaflow_init(*args, **kwargs):
                     _te.process.kill()
                 raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
             if result.returncode == 0:
-                break
+                if result.stdout:
+                    print("STDOUT:", result.stdout[-2000:])
+                return
             if retry_count < max_retries:
                 print("Step {step_name} split_index=%d failed on attempt %d, retrying..." % (split_index, retry_count))
                 if result.stderr:
@@ -698,8 +701,12 @@ def metaflow_init(*args, **kwargs):
                 "Metaflow step {step_name!r} split_index=%d failed (exit %d): %s"
                 % (split_index, result.returncode, result.stderr[-500:])
             )
-        if result.stdout:
-            print("STDOUT:", result.stdout[-2000:])
+
+    with _TPE(max_workers={max_workers}) as _pool:
+        for _f in [_pool.submit(_run_one_split, i) for i in range(foreach_count)]:
+            _f.result()  # re-raises any exception from workers
+
+    task_id = run_id + "-" + {step_name_repr} + "-0"  # for foreach count reader below
 {foreach_read_code}
     print("Step {step_name} completed all %d foreach items" % foreach_count)
     return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"{foreach_return_extra}}}
@@ -712,6 +719,7 @@ def metaflow_init(*args, **kwargs):
             foreach_read_code=foreach_read_code,
             foreach_return_extra=foreach_return_extra,
             timeout_kwarg=timeout_kwarg,
+            max_workers=self.max_workers,
         )
 
     def _render_nested_foreach_body(
@@ -743,41 +751,49 @@ def metaflow_init(*args, **kwargs):
         timeout_kwarg = ", timeout=_timeout" if timeout_seconds else ""
 
         return '''{preamble}
-    # Nested foreach: iterate over all (outer_i, inner_j) combinations
-    for outer_i in range(foreach_count):
-        inner_count = nested_foreach_counts[outer_i] if outer_i < len(nested_foreach_counts) else 1
-        parent_task_id = run_id + "-" + {parent_step_repr} + "-" + str(outer_i)
-        for inner_j in range(inner_count):
-            task_id = run_id + "-" + {step_name_repr} + "-" + str(outer_i) + "-" + str(inner_j)
-            input_paths = run_id + "/" + {parent_step_repr} + "/" + parent_task_id
-            for retry_count in range(max_retries + 1):
-                step_cmd = {step_cmd_list}
-                step_cmd += ["--split-index", str(inner_j)]
-                step_cmd += ["--input-paths", input_paths]
-                cmd = top_cmd + step_cmd
+    from concurrent.futures import ThreadPoolExecutor as _TPE
 
-                print("Running {step_name} outer=%d inner=%d retry=%d (task_id=%s)" % (outer_i, inner_j, retry_count, task_id))
-                try:
-                    result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
-                except subprocess.TimeoutExpired as _te:
-                    if _te.process:
-                        _te.process.kill()
-                    raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
-                if result.returncode == 0:
-                    break
-                if retry_count < max_retries:
-                    print("Step {step_name} outer=%d inner=%d failed on attempt %d, retrying..." % (outer_i, inner_j, retry_count))
-                    if result.stderr:
-                        print("STDERR:", result.stderr[-2000:])
-                    continue
-                print("STDOUT:", result.stdout[-4000:])
-                print("STDERR:", result.stderr[-4000:])
-                raise RuntimeError(
-                    "Metaflow step {step_name!r} outer=%d inner=%d failed (exit %d): %s"
-                    % (outer_i, inner_j, result.returncode, result.stderr[-500:])
-                )
-            if result.stdout:
-                print("STDOUT:", result.stdout[-2000:])
+    def _run_one_task(outer_i, inner_j):
+        parent_task_id = run_id + "-" + {parent_step_repr} + "-" + str(outer_i)
+        task_id = run_id + "-" + {step_name_repr} + "-" + str(outer_i) + "-" + str(inner_j)
+        input_paths = run_id + "/" + {parent_step_repr} + "/" + parent_task_id
+        for retry_count in range(max_retries + 1):
+            step_cmd = {step_cmd_list}
+            step_cmd += ["--split-index", str(inner_j)]
+            step_cmd += ["--input-paths", input_paths]
+            cmd = top_cmd + step_cmd
+            print("Running {step_name} outer=%d inner=%d retry=%d (task_id=%s)" % (outer_i, inner_j, retry_count, task_id))
+            try:
+                result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+            except subprocess.TimeoutExpired as _te:
+                if _te.process:
+                    _te.process.kill()
+                raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
+            if result.returncode == 0:
+                if result.stdout:
+                    print("STDOUT:", result.stdout[-2000:])
+                return
+            if retry_count < max_retries:
+                print("Step {step_name} outer=%d inner=%d failed on attempt %d, retrying..." % (outer_i, inner_j, retry_count))
+                if result.stderr:
+                    print("STDERR:", result.stderr[-2000:])
+                continue
+            print("STDOUT:", result.stdout[-4000:])
+            print("STDERR:", result.stderr[-4000:])
+            raise RuntimeError(
+                "Metaflow step {step_name!r} outer=%d inner=%d failed (exit %d): %s"
+                % (outer_i, inner_j, result.returncode, result.stderr[-500:])
+            )
+
+    _task_pairs = [
+        (oi, ij)
+        for oi in range(foreach_count)
+        for ij in range(nested_foreach_counts[oi] if oi < len(nested_foreach_counts) else 1)
+    ]
+    with _TPE(max_workers={max_workers}) as _pool:
+        for _f in [_pool.submit(_run_one_task, oi, ij) for oi, ij in _task_pairs]:
+            _f.result()
+
 {nested_read_code}
     print("Step {step_name} completed all nested foreach items")
     return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "nested_foreach_counts": nested_foreach_counts, "status": "success"{nested_return_extra}}}
@@ -790,6 +806,7 @@ def metaflow_init(*args, **kwargs):
             nested_read_code=nested_read_code,
             nested_return_extra=nested_return_extra,
             timeout_kwarg=timeout_kwarg,
+            max_workers=self.max_workers,
         )
 
     def _render_nested_foreach_join(
@@ -819,8 +836,9 @@ def metaflow_init(*args, **kwargs):
         timeout_kwarg = ", timeout=_timeout" if timeout_seconds else ""
 
         return '''{preamble}
-    # Nested foreach join: run join once per outer iteration
-    for outer_i in range(foreach_count):
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    def _run_one_join(outer_i):
         inner_count = nested_foreach_counts[outer_i] if outer_i < len(nested_foreach_counts) else 1
         task_id = run_id + "-" + {step_name_repr} + "-" + str(outer_i)
         input_paths = ",".join(
@@ -831,7 +849,6 @@ def metaflow_init(*args, **kwargs):
             step_cmd = {step_cmd_list}
             step_cmd += ["--input-paths", input_paths]
             cmd = top_cmd + step_cmd
-
             print("Running {step_name} outer=%d retry=%d (task_id=%s)" % (outer_i, retry_count, task_id))
             try:
                 result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
@@ -840,7 +857,9 @@ def metaflow_init(*args, **kwargs):
                     _te.process.kill()
                 raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
             if result.returncode == 0:
-                break
+                if result.stdout:
+                    print("STDOUT:", result.stdout[-2000:])
+                return
             if retry_count < max_retries:
                 print("Step {step_name} outer=%d failed on attempt %d, retrying..." % (outer_i, retry_count))
                 if result.stderr:
@@ -852,8 +871,10 @@ def metaflow_init(*args, **kwargs):
                 "Metaflow step {step_name!r} outer=%d failed (exit %d): %s"
                 % (outer_i, result.returncode, result.stderr[-500:])
             )
-        if result.stdout:
-            print("STDOUT:", result.stdout[-2000:])
+
+    with _TPE(max_workers={max_workers}) as _pool:
+        for _f in [_pool.submit(_run_one_join, i) for i in range(foreach_count)]:
+            _f.result()
 
     print("Step {step_name} completed all %d join iterations" % foreach_count)
     return {{"run_id": run_id, "step": {step_name!r}, "foreach_count": foreach_count, "status": "success"}}
@@ -864,6 +885,7 @@ def metaflow_init(*args, **kwargs):
             parent_step_repr=repr(parent_step),
             step_cmd_list=step_cmd_list,
             timeout_kwarg=timeout_kwarg,
+            max_workers=self.max_workers,
         )
 
     def _render_regular_step_block(
