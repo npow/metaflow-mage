@@ -154,6 +154,7 @@ jobs:
           use-sudo: "true"
           conda: "false"
           coverage-artifact-suffix: "${{ matrix.test }}"
+          test-files: "test_basic.py test_config.py test_dag.py test_compliance.py"
           pytest-args: "-v --tb=short --timeout=300 -k '${{ matrix.test }} and deployer' --cov-fail-under=0"
           ux-test-config: |
             backends:

@@ -496,7 +496,7 @@ def run_{step_name}(*args, **kwargs):
             '            "foreach step %s: failed to read _foreach_num_splits from datastore "\n'
             '            "(run_id=%%s, task_id=%%s): %%s" %% (run_id, task_id, _e)\n'
             '        ) from _e\n'
-        ) % (step_name, step_name)
+        ) % (step_name, step_name, step_name)
 
     def _build_foreach_count_reader_loop(self, step_name: str) -> str:
         """Return code that reads _foreach_num_splits per foreach body task.
