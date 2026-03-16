@@ -197,6 +197,10 @@ def trigger(
     for kv in run_params:
         k, _, v = kv.partition("=")
         variables[k.strip()] = v.strip()
+    if "pipeline_run_id" in variables:
+        raise MageException(
+            "'pipeline_run_id' is a Mage internal variable and cannot be used as a run parameter."
+        )
 
     # Look up schedule if not provided
     if not schedule_id or not schedule_token:
@@ -256,6 +260,20 @@ def trigger(
     show_default=True,
     help="Wait for the pipeline run to complete.",
 )
+@click.option(
+    "--max-wait",
+    default=3600,
+    show_default=True,
+    type=int,
+    help="Maximum seconds to wait for pipeline run completion (default: 3600).",
+)
+@click.option(
+    "--run-param",
+    "run_params",
+    multiple=True,
+    default=None,
+    help="Flow parameter as key=value (repeatable).",
+)
 @click.pass_obj
 def run(
     obj,
@@ -268,6 +286,8 @@ def run(
     branch,
     production,
     wait,
+    max_wait,
+    run_params,
 ):
     _validate_workflow(obj.flow, obj.graph)
 
@@ -284,15 +304,24 @@ def run(
     _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj)
     schedule_id, schedule_token = _ensure_api_trigger(client, mage_host, pipeline_uuid, obj)
 
+    if any(kv.partition("=")[0].strip() == "pipeline_run_id" for kv in (run_params or [])):
+        raise MageException(
+            "'pipeline_run_id' is a Mage internal variable and cannot be used as a run parameter."
+        )
+    variables = {}
+    for kv in (run_params or []):
+        k, _, v = kv.partition("=")
+        variables[k.strip()] = v.strip()
+
     obj.echo("Triggering pipeline run...", bold=True)
-    pipeline_run_id = _trigger_pipeline_run(mage_host, schedule_id, schedule_token)
+    pipeline_run_id = _trigger_pipeline_run(mage_host, schedule_id, schedule_token, variables or None)
 
     pipeline_run_url = "%s/pipelines/%s/runs/%d" % (mage_host, pipeline_uuid, pipeline_run_id)
     obj.echo("Pipeline run started: *%s*" % pipeline_run_url)
 
     if wait:
         obj.echo("Waiting for pipeline run to complete...")
-        final_status = _wait_for_pipeline_run(mage_host, pipeline_run_id, obj)
+        final_status = _wait_for_pipeline_run(mage_host, pipeline_run_id, obj, max_wait_seconds=max_wait)
         if final_status == "completed":
             obj.echo("Pipeline run *%d* completed successfully." % pipeline_run_id, bold=True)
         else:
@@ -394,16 +423,22 @@ def _make_client(host: str):
         )
     session = requests.Session()
     session.headers["Content-Type"] = "application/json"
+    session.mount("http://", requests.adapters.HTTPAdapter())
+    session.mount("https://", requests.adapters.HTTPAdapter())
     session._mage_host = host
+    session._default_timeout = 30
     return session
 
 
 def _pipeline_exists(client, host, pipeline_uuid) -> bool:
     """Return True if the pipeline already exists in Mage."""
-    resp = client.get("%s/api/pipelines/%s" % (host, pipeline_uuid))
+    resp = client.get("%s/api/pipelines/%s" % (host, pipeline_uuid), timeout=30)
     if resp.status_code != 200:
         return False
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception:
+        return False
     # Mage returns HTTP 200 with {"error": {...}} when pipeline doesn't exist
     if "error" in data:
         return False
@@ -418,22 +453,32 @@ def _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj
     if _pipeline_exists(client, host, pipeline_uuid):
         # Update existing pipeline - delete old blocks first, then recreate
         obj.echo("Updating existing pipeline *%s*..." % pipeline_uuid)
-        resp = client.get("%s/api/pipelines/%s" % (host, pipeline_uuid))
+        resp = client.get("%s/api/pipelines/%s" % (host, pipeline_uuid), timeout=30)
         existing_data = resp.json().get("pipeline", {})
         existing_blocks = existing_data.get("blocks", [])
         for blk in existing_blocks:
-            client.delete(
-                "%s/api/pipelines/%s/blocks/%s" % (host, pipeline_uuid, blk["uuid"])
+            del_resp = client.delete(
+                "%s/api/pipelines/%s/blocks/%s" % (host, pipeline_uuid, blk["uuid"]),
+                timeout=30,
             )
+            if del_resp.status_code not in (200, 204, 404):
+                obj.echo(
+                    "Warning: failed to delete block %r (HTTP %d)" % (blk["uuid"], del_resp.status_code)
+                )
     else:
         # Create new pipeline
         obj.echo("Creating new pipeline *%s*..." % pipeline_uuid)
         create_resp = client.post(
             "%s/api/pipelines" % host,
             json={"pipeline": {"name": pipeline_uuid, "type": "python"}},
+            timeout=30,
         )
-        if create_resp.status_code not in (200, 201) or "error" in create_resp.json():
-            err_text = create_resp.json().get("error", {}).get("message", create_resp.text[:300])
+        try:
+            _create_resp_data = create_resp.json()
+        except Exception:
+            _create_resp_data = {}
+        if create_resp.status_code not in (200, 201) or "error" in _create_resp_data:
+            err_text = _create_resp_data.get("error", {}).get("message", create_resp.text[:300])
             raise MageException(
                 "Failed to create Mage pipeline (HTTP %d): %s"
                 % (create_resp.status_code, err_text)
@@ -453,6 +498,7 @@ def _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj
                     "content": block["content"],
                 }
             },
+            timeout=30,
         )
         if block_resp.status_code not in (200, 201):
             raise MageException(
@@ -476,6 +522,7 @@ def _deploy_pipeline(client, mage_host, mage_project, pipeline_uuid, blocks, obj
         update_resp = client.put(
             "%s/api/pipelines/%s/blocks/%s" % (host, pipeline_uuid, block["name"]),
             json={"block": update_payload},
+            timeout=30,
         )
         if update_resp.status_code not in (200, 201):
             raise MageException(
@@ -499,7 +546,8 @@ def _ensure_api_trigger(client, mage_host, pipeline_uuid, obj):
 
     # List existing schedules
     resp = client.get(
-        "%s/api/pipelines/%s/pipeline_schedules" % (host, pipeline_uuid)
+        "%s/api/pipelines/%s/pipeline_schedules" % (host, pipeline_uuid),
+        timeout=30,
     )
 
     if resp.status_code == 200 and "error" not in resp.json():
@@ -521,8 +569,12 @@ def _ensure_api_trigger(client, mage_host, pipeline_uuid, obj):
                 "status": "active",
             }
         },
+        timeout=30,
     )
-    resp_data = create_resp.json()
+    try:
+        resp_data = create_resp.json()
+    except Exception:
+        resp_data = {}
     if create_resp.status_code not in (200, 201) or "error" in resp_data:
         err_text = resp_data.get("error", {}).get("message", create_resp.text[:300])
         raise MageException(
@@ -549,7 +601,7 @@ def _trigger_pipeline_run(mage_host, schedule_id, schedule_token, variables=None
     if variables:
         payload = {"pipeline_run": {"variables": variables}}
 
-    resp = requests.post(url, json=payload)
+    resp = requests.post(url, json=payload, timeout=30)
     if resp.status_code not in (200, 201):
         raise MageException(
             "Failed to trigger pipeline run (HTTP %d): %s"
@@ -559,10 +611,11 @@ def _trigger_pipeline_run(mage_host, schedule_id, schedule_token, variables=None
     return resp.json()["pipeline_run"]["id"]
 
 
-def _wait_for_pipeline_run(mage_host, pipeline_run_id, obj, poll_interval=5):
+def _wait_for_pipeline_run(mage_host, pipeline_run_id, obj, poll_interval=5, max_wait_seconds=3600):
     """Poll until the pipeline run reaches a terminal state and return the status."""
     terminal_statuses = {"completed", "failed", "cancelled", "canceled"}
     url = "%s/api/pipeline_runs/%d" % (mage_host, pipeline_run_id)
+    _start = time.time()
 
     try:
         import requests
@@ -571,8 +624,13 @@ def _wait_for_pipeline_run(mage_host, pipeline_run_id, obj, poll_interval=5):
 
     seen_running = False
     while True:
+        if time.time() - _start > max_wait_seconds:
+            raise MageException(
+                "Pipeline run %d did not complete within %d seconds."
+                % (pipeline_run_id, max_wait_seconds)
+            )
         try:
-            resp = requests.get(url)
+            resp = requests.get(url, timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
                 status = data.get("pipeline_run", {}).get("status", "unknown")
@@ -581,8 +639,20 @@ def _wait_for_pipeline_run(mage_host, pipeline_run_id, obj, poll_interval=5):
                     seen_running = True
                 if status in terminal_statuses:
                     return status
+            elif resp.status_code in (404, 410):
+                raise MageException(
+                    "Pipeline run %d no longer exists (HTTP %d). "
+                    "It may have been deleted." % (pipeline_run_id, resp.status_code)
+                )
+            elif 400 <= resp.status_code < 500:
+                raise MageException(
+                    "Permanent error polling run %d (HTTP %d): %s"
+                    % (pipeline_run_id, resp.status_code, resp.text[:200])
+                )
             else:
                 obj.echo("Warning: could not poll run status (HTTP %d)" % resp.status_code)
+        except MageException:
+            raise
         except Exception as exc:
             obj.echo("Warning: error polling run: %s" % exc)
 

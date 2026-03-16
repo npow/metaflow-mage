@@ -18,6 +18,21 @@ env:
   METAFLOW_DEFAULT_ENVIRONMENT: local
 
 jobs:
+  # Fast unit tests that run without a Mage instance (compiler correctness, CLI helpers).
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install
+        run: pip install -e ".[dev]" --quiet
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+
   # Runner tests execute flows locally — no Mage scheduler needed.
   runner-tests:
     runs-on: ubuntu-latest
@@ -77,6 +92,9 @@ jobs:
           - test_branch
           - test_foreach
           - test_nested_foreach
+          - test_nested_foreach_2x2
+          - test_timeout_minutes_enforced
+          - test_run_param_not_dropped
           - test_timeout_enforcement
 
     steps:
@@ -158,7 +176,7 @@ jobs:
 
   test-report:
     if: always()
-    needs: [runner-tests, deployer-tests]
+    needs: [unit-tests, runner-tests, deployer-tests]
     runs-on: ubuntu-latest
     permissions:
       contents: read

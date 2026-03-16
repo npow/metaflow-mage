@@ -128,6 +128,14 @@ class MageTriggeredRun(TriggeredRun):
                 if flow_name:
                     pathspec = "%s/%s" % (flow_name, run_id)
                     self.pathspec = pathspec
+                else:
+                    import warnings
+                    warnings.warn(
+                        "Could not resolve flow name for run_id=%r. "
+                        "The Metaflow datastore may not be accessible locally, "
+                        "or the run may not have been recorded. "
+                        "Check that METAFLOW_DATASTORE_SYSROOT_LOCAL is set correctly." % run_id
+                    )
 
             return metaflow.Run(pathspec, _namespace_check=False)
         except MetaflowNotFound:
@@ -326,6 +334,11 @@ class MageDeployedFlow(DeployedFlow):
 
         pipeline_run_data = resp.json().get("pipeline_run", {})
         pipeline_run_id = pipeline_run_data.get("id")
+        if pipeline_run_id is None:
+            raise RuntimeError(
+                "Mage API response missing 'id' field in pipeline_run. "
+                "Response data: %s" % str(pipeline_run_data)[:200]
+            )
 
         # Compute the Metaflow run_id the same way the init block does:
         # mage-{md5(str(pipeline_run_id))[:16]}
@@ -336,11 +349,14 @@ class MageDeployedFlow(DeployedFlow):
         # Pipeline UUIDs (e.g. "hello_from_deployment_user_npow_hellofromdeploymentflow")
         # are stored as mf_flow_class when recovered from a plain identifier, but they
         # can't be used as pathspecs. Use "UNKNOWN" to trigger datastore scan in .run.
-        if flow_class_name and (
-            "_" in flow_class_name  # pipeline UUIDs always have underscores
-            or not flow_class_name[0].isupper()  # class names start with uppercase
-        ):
-            flow_class_name = None
+        if flow_class_name:
+            # @project flows have dotted names like "project.branch.ClassName" — take last component
+            if "." in flow_class_name:
+                flow_class_name = flow_class_name.split(".")[-1]
+            # After extracting last component, validate it's a Python class name:
+            # starts with uppercase letter, contains only alnum/underscore, not all-lowercase
+            if not (flow_class_name and flow_class_name[0].isupper() and flow_class_name.isidentifier()):
+                flow_class_name = None
         if not flow_class_name:
             flow_class_name = "UNKNOWN"
         pathspec = "%s/%s" % (flow_class_name, run_id)

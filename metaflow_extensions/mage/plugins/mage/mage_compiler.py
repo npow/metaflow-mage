@@ -34,6 +34,7 @@ _BLOCK_HEADER = """\
 import os
 import subprocess
 import sys
+import time
 
 if 'custom' not in globals():
     from mage_ai.data_preparation.decorators import custom
@@ -94,6 +95,7 @@ class MageCompiler:
         self.with_decorators = with_decorators or []
         self.branch = branch
         self.production = production
+        self._environment_type = getattr(environment, "TYPE", "local")
 
         self._project_info = self._get_project()
         self._flow_name = (
@@ -196,6 +198,20 @@ class MageCompiler:
                 else:
                     default = d
             params[var] = {"default": default, "param": param}
+        _MAGE_INTERNAL_KEYS = {
+            'pipeline_run_id', 'context', 'block_uuid', 'event',
+            'configuration', 'spark', 'logger', 'run_started_at',
+            'trigger_name', 'execution_date', 'execution_partition',
+            'ds', 'hr', 'interval_start_datetime', 'interval_end_datetime',
+            'interval_seconds', 'retry', 'env',
+        }
+        for var in params:
+            if var in _MAGE_INTERNAL_KEYS:
+                raise ValueError(
+                    "Flow parameter %r conflicts with a Mage internal variable name. "
+                    "Rename the parameter or it will be silently dropped at runtime. "
+                    "Reserved names: %s" % (var, ", ".join(sorted(_MAGE_INTERNAL_KEYS)))
+                )
         return params
 
     def _build_env_vars(self) -> Dict[str, str]:
@@ -270,9 +286,13 @@ class MageCompiler:
         if step_obj is not None:
             for deco in step_obj.decorators:
                 if deco.name == "timeout":
-                    seconds = deco.attributes.get("seconds")
-                    if seconds is not None:
-                        return int(seconds)
+                    attrs = deco.attributes
+                    total = (
+                        int(attrs.get("hours") or 0) * 3600
+                        + int(attrs.get("minutes") or 0) * 60
+                        + int(attrs.get("seconds") or 0)
+                    )
+                    return total if total > 0 else None
         return None
 
     def _get_parent_step(self, step_node) -> str:
@@ -375,7 +395,10 @@ class MageCompiler:
         """
         timeout_line = ""
         if timeout_seconds:
-            timeout_line = "\n    _timeout = %d  # @timeout seconds" % timeout_seconds
+            timeout_line = (
+                "\n    _timeout = %d  # @timeout seconds"
+                "\n    _deadline = time.monotonic() + _timeout" % timeout_seconds
+            )
         return '''{header}
 @custom
 def run_{step_name}(*args, **kwargs):
@@ -409,6 +432,7 @@ def run_{step_name}(*args, **kwargs):
             repr(self.flow_file),
             '"--no-pylint"',
             '"--quiet"',
+            '"--environment"', repr(self._environment_type),
             '"--metadata"', repr(self._metadata_type),
             '"--datastore"', repr(self._datastore_type),
         ]
@@ -454,7 +478,10 @@ def run_{step_name}(*args, **kwargs):
             '        foreach_count = int(_tds["_foreach_num_splits"])\n'
             '        print("Foreach step %s:", foreach_count, "items")\n'
             '    except Exception as _e:\n'
-            '        print("Warning: foreach_count error:", _e)\n'
+            '        raise RuntimeError(\n'
+            '            "foreach step %s: failed to read _foreach_num_splits from datastore "\n'
+            '            "(run_id=%%s, task_id=%%s): %%s" %% (run_id, task_id, _e)\n'
+            '        ) from _e\n'
         ) % (step_name, step_name)
 
     def _build_foreach_count_reader_loop(self, step_name: str) -> str:
@@ -470,20 +497,23 @@ def run_{step_name}(*args, **kwargs):
             '    try:\n'
             + _FOREACH_NUM_SPLITS_READER_SNIPPET.format(flow_name=self.name)
             + '    except Exception as _e:\n'
-            '        print("Warning: could not init FlowDataStore for nested foreach:", _e)\n'
-            '        _fds = None\n'
+            '        raise RuntimeError(\n'
+            '            "foreach step %s: failed to initialize FlowDataStore for nested foreach: %%s" %% _e\n'
+            '        ) from _e\n'
             '    for _nfc_i in range(foreach_count):\n'
             '        _nfc_task_id = run_id + "-" + %r + "-" + str(_nfc_i)\n'
             '        _nfc_count = 1\n'
-            '        if _fds is not None:\n'
-            '            try:\n'
-            '                _nfc_tds = _fds.get_task_datastore(run_id, %r, _nfc_task_id, attempt=0, mode="r")\n'
-            '                _nfc_count = int(_nfc_tds["_foreach_num_splits"])\n'
-            '            except Exception as _e:\n'
-            '                print("Warning: nested foreach_count error for task %%s: %%s" %% (_nfc_task_id, _e))\n'
+            '        try:\n'
+            '            _nfc_tds = _fds.get_task_datastore(run_id, %r, _nfc_task_id, attempt=0, mode="r")\n'
+            '            _nfc_count = int(_nfc_tds["_foreach_num_splits"])\n'
+            '        except Exception as _e:\n'
+            '            raise RuntimeError(\n'
+            '                "foreach step %s: failed to read _foreach_num_splits from datastore "\n'
+            '                "(run_id=%%s, task_id=%%s): %%s" %% (run_id, _nfc_task_id, _e)\n'
+            '            ) from _e\n'
             '        nested_foreach_counts.append(_nfc_count)\n'
             '        print("Nested foreach: %%s task %%d has %%d items" %% (%r, _nfc_i, _nfc_count))\n'
-        ) % (step_name, step_name, step_name)
+        ) % (step_name, step_name, step_name, step_name, step_name)
 
     def _build_input_paths_code(self, step_name: str, step_node) -> str:
         """Return Python code fragment that computes `input_paths` for a step."""
@@ -562,6 +592,7 @@ def metaflow_init(*args, **kwargs):
         {flow_file!r},
         "--no-pylint",
         "--quiet",
+        "--environment", {environment_type!r},
         "--metadata", {metadata_type!r},
         "--datastore", {datastore_type!r},
 {datastore_root_line}
@@ -581,6 +612,7 @@ def metaflow_init(*args, **kwargs):
             header=_BLOCK_HEADER,
             env_lines=env_lines,
             flow_file=self.flow_file,
+            environment_type=self._environment_type,
             metadata_type=self._metadata_type,
             datastore_type=self._datastore_type,
             tag_args=tag_args,
@@ -627,7 +659,12 @@ def metaflow_init(*args, **kwargs):
             cmd = top_cmd + step_cmd
 
             print("Running {step_name} split_index=%d retry=%d (task_id=%s)" % (split_index, retry_count, task_id))
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+            try:
+                result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+            except subprocess.TimeoutExpired as _te:
+                if _te.process:
+                    _te.process.kill()
+                raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
             if result.returncode == 0:
                 break
             if retry_count < max_retries:
@@ -700,7 +737,12 @@ def metaflow_init(*args, **kwargs):
                 cmd = top_cmd + step_cmd
 
                 print("Running {step_name} outer=%d inner=%d retry=%d (task_id=%s)" % (outer_i, inner_j, retry_count, task_id))
-                result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+                try:
+                    result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+                except subprocess.TimeoutExpired as _te:
+                    if _te.process:
+                        _te.process.kill()
+                    raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
                 if result.returncode == 0:
                     break
                 if retry_count < max_retries:
@@ -771,7 +813,12 @@ def metaflow_init(*args, **kwargs):
             cmd = top_cmd + step_cmd
 
             print("Running {step_name} outer=%d retry=%d (task_id=%s)" % (outer_i, retry_count, task_id))
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+            try:
+                result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+            except subprocess.TimeoutExpired as _te:
+                if _te.process:
+                    _te.process.kill()
+                raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
             if result.returncode == 0:
                 break
             if retry_count < max_retries:
@@ -841,7 +888,12 @@ def metaflow_init(*args, **kwargs):
             step_cmd += ["--input-paths", input_paths]
         cmd = top_cmd + step_cmd
 
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+        try:
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True{timeout_kwarg})
+        except subprocess.TimeoutExpired as _te:
+            if _te.process:
+                _te.process.kill()
+            raise RuntimeError("subprocess timed out on attempt %d" % retry_count) from _te
         if result.returncode == 0:
             break
         if retry_count < max_retries:
@@ -919,8 +971,8 @@ def metaflow_init(*args, **kwargs):
     # ------------------------------------------------------------------
 
     def _block_prefix(self) -> str:
-        """Short prefix derived from pipeline UUID for unique block naming."""
-        return self.pipeline_uuid[:12]
+        """Full pipeline UUID used as block name prefix to guarantee uniqueness."""
+        return self.pipeline_uuid
 
     def compile(self) -> List[Dict[str, Any]]:
         """Return a list of block dicts describing the Mage pipeline.
