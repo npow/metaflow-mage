@@ -94,15 +94,21 @@ jobs:
           - test_foreach
           - test_nested_foreach
           - test_nested_foreach_2x2
+          # compliance tests — each gets its own clean matrix slot
+          - test_timeout_enforcement
           - test_timeout_minutes_enforced
           - test_run_param_not_dropped
-          - test_timeout_enforcement
           - test_retry_count_from_scheduler
+          - test_branch_propagated_to_steps
+          - test_run_params_multiple_values
+          - test_config_value_propagated
         include:
-          # test_retry's -k filter would also pick up test_retry_count_from_scheduler
-          # (substring match). Give the compliance test its own job and exclude it here.
+          # Compliance tests share name substrings with general entries, causing
+          # them to be collected twice. Override the general entry filter to exclude them.
           - test: test_retry
             filter: "test_retry and deployer and not count_from_scheduler"
+          - test: test_branch
+            filter: "test_branch and deployer and not propagated"
 
     steps:
       - uses: actions/checkout@v4
