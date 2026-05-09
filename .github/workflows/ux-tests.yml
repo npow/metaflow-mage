@@ -49,9 +49,9 @@ jobs:
       - name: Pin Metaflow local datastore root
         run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
 
-      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@master
         with:
-          metaflow-ref: npow/corral-devstack
+          metaflow-ref: master
           extra-install: "."
           use-sudo: "false"
           conda: "false"
@@ -155,16 +155,16 @@ jobs:
           CONTAINER=$(docker ps -q --filter name=mage)
           # Install metaflow (matching the branch under test).
           docker exec "$CONTAINER" pip install --quiet \
-            "git+https://github.com/Netflix/metaflow.git@npow/corral-devstack"
+            "git+https://github.com/Netflix/metaflow.git@master"
           # Copy the extension source into the container at a non-mounted path so
           # root-owned build artifacts (egg-info) don't pollute the workspace and
           # cause permission errors when the runner later runs `pip install -e .`.
           docker cp "${{ github.workspace }}/." "$CONTAINER:/tmp/metaflow-mage-src/"
           docker exec "$CONTAINER" pip install --quiet /tmp/metaflow-mage-src
 
-      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@master
         with:
-          metaflow-ref: npow/corral-devstack
+          metaflow-ref: master
           extra-install: "."
           # Mage runs as root and creates root-owned .metaflow artifact files;
           # sudo -E lets pytest read them without permission errors.
